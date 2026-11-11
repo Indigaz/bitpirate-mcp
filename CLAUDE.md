@@ -4,130 +4,116 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-buspirate-mcp is an MCP server that wraps the BusPirate 6's BPIO2 binary protocol SDK, exposing UART, power supply, GPIO, and flash-dump operations as MCP tools over stdio transport.
+bitpirate-mcp is an MCP server for the ESP32-Bit-Pirate (ESP32-S3 devkit
+running geo-tp/ESP32-Bit-Pirate v1.x firmware). It drives the firmware's text
+console over USB CDC (/dev/ttyACM0 @115200) and exposes UART, SPI (native
+flash shell), I2C, 1-Wire, and GPIO operations as MCP tools over stdio.
+It is a port of mplogas/buspirate-mcp (BPIO2 protocol) to this board.
 
 ## Architecture
 
 ```
-MCP client (Claude Code, etc.)
+MCP client (stdio)
   |
-  stdio transport
+server.py            tool defs + dispatch + safety tiers + sessions
   |
-buspirate-mcp (server.py)
+tools.py             tool implementations
   |
-  tools.py -> hardware.py -> BPIO2 SDK
-  |
-BusPirate 6 -> Target Device
+bitpirate_hardware.py  THE device layer (only firmware-specific module)
+  |  pyserial
+  v
+ESP32-S3 text console (ESP32-Bit-Pirate v1.8)
 ```
 
-Only `hardware.py` imports from the BPIO2 SDK. Everything else talks to `hardware.py`. This makes mocking trivial for tests.
+Only `bitpirate_hardware.py` talks to the serial port. Everything else calls
+its methods. This makes mocking trivial for tests.
+
+### Console transport: two read modes
+
+Firmware flows do not all end the same way:
+
+- **Prompt-aware** (`_cmd` / `_read_until_prompt`): command, then read until a
+  mode prompt (`DIO> `, `SPI> `, ...) matches at the END of the transcript.
+  Prompt regex is `[A-Z0-9]{2,10}>[ \t]*\r?\s*$` (digits matter: `I2C>`).
+  Used for mode switches, DIO commands, instruction syntax.
+- **Marker-aware** (`_wait_marker`): flash-shell and config-wizard flows end
+  at completion markers (`=== SPI Flash Shell ===`, `SPI Flash Dump: Done.`,
+  `SPI configured.`, ...), not prompts. The driver answers intermediate
+  prompts in firmware order: choice prompts are 1-indexed with empty=default,
+  number prompts `label [def]: `, yes/no `label [y]: `/`[n]: `.
+
+Firmware error markers in a transcript raise `BitPirateCLIError` with the
+transcript attached. Line length is capped at 250 chars (quadratic-echo guard
+in the firmware's getLine).
+
+### Flash shell (SPI mode)
+
+`flash` opens a persistent menu shell (1 Probe, 2 Analyze, 3 Search, 4
+Strings, 5 Read, 6 Write, 7 Dump hex, 8 Dump RAW, 9 Erase, 10 Exit). The
+driver tracks `_flash_shell_open` and reuses the shell across calls;
+`close_spi` / `disconnect` exit it. Menu 8 streams raw bytes over the
+console (serial-bottlenecked ~11.5 KB/s; `_dump_timeout` computes the
+deadline from capacity). Raw dump ends at the `SPI Flash Dump: Done.`
+sentinel, which the driver strips from the file.
+
+Instruction syntax `[0x9F r:3]` is dispatched by the firmware to the active
+mode's `handleInstruction`; SPI results print `SPI Read:` + uppercase hex
+`%02X ` per byte. Write-only instructions print nothing (returns b"").
+
+### Grounding rule
+
+Every command string, prompt marker, and completion marker in the driver
+comes from the v1.8 firmware source (SpiFlashShell.cpp, SpiController.cpp,
+DioController.cpp, UserInputManager.cpp, ActionDispatcher.cpp). Do not
+"improve" a command string from memory - check the firmware source first.
 
 ## Safety Model
 
-Three tiers enforced at the MCP server boundary:
+Three tiers enforced at the MCP server boundary (safety.py):
 
-- **read-only**: full autonomy (list_devices, verify_connection, scan_baud, read_output, spi_probe, spi_read, spi_dump, spi_transfer, i2c_scan, i2c_read, i2c_dump, onewire_search, onewire_read, la_command, la_analyze, la_identify)
-- **allowed-write**: autonomous but logged (open_uart, send_command, close_uart, enter_download_mode, read_flash, open_spi, close_spi, open_i2c, close_i2c, open_1wire, close_1wire, la_prepare, la_cleanup)
-- **approval-write**: blocks until human confirms via _confirmed token (set_voltage, set_power, spi_write, i2c_write)
+- **read-only**: list_devices, verify_connection, scan_baud, read_output,
+  spi_probe, spi_read, spi_dump, spi_transfer, spi_flash_analyze,
+  spi_flash_search, spi_flash_strings, i2c_scan, i2c_read, i2c_dump,
+  onewire_search, onewire_read
+- **allowed-write**: open_uart, send_command, close_uart, enter_download_mode,
+  read_flash, open_spi, close_spi, spi_config, open_i2c, close_i2c,
+  open_1wire, close_1wire
+- **approval-write**: set_voltage, set_power, spi_write, i2c_write,
+  spi_flash_erase - require literal `_confirmed: true` AND the firmware's own
+  confirmation prompt is driven. Do not bypass or weaken either gate.
 
-Wrong voltage fries chips. Writing SPI flash or I2C devices overwrites data irreversibly. Do not bypass or weaken the approval-write gate.
+## Board Notes
 
-## BusPirate 6 Hardware Notes
-
-### BPIO2 binary mode
-
-The BP6 must have BPIO2 binary mode enabled before the SDK can talk to it. Enable via the terminal port (ACM0): `binmode` -> select `2` (BPIO2 flatbuffer interface) -> `y` to save. This persists across reboots.
-
-### Pin mapping (UART)
-
-BP6 UART mode uses IO4 (TX->) and IO5 (RX<-). The BP display is the authoritative source for pin assignment.
-
-**Beware:** `status_request()` returns a `mode_pin_labels` array that includes VOUT at index 0, shifting all labels by one. Index 5 in the labels array = physical IO4, index 6 = IO5. Trust the display, not the raw array indices.
-
-### SPI Mode
-
-- Pin mapping: IO2=CLK, IO3=MISO, IO4=MOSI, IO5=CS
-- Default speed: 1 MHz, configurable up to 12 MHz for flash dumps
-- SPI flash commands: JEDEC ID (0x9F), Read (0x03), Write Enable (0x06), Page Program (0x02), Chip Erase (0xC7)
-- Flash dumps use 512-byte chunks to avoid buffer overruns
-
-### I2C Mode
-
-- Pin mapping: IO4=SDA, IO5=SCL
-- Default speed: 400 kHz (fast mode), configurable
-- Pullups enabled by default (required for I2C)
-- SDK scan() has print() calls -- hardware.py redirects stdout to prevent MCP stdio corruption
-
-### 1-Wire Mode
-
-- Pin mapping: IO4=DQ (data line)
-- Pullup enabled by default (required for 1-Wire)
-- Read ROM (0x33) supports single-device identification. Multi-device search not implemented in SDK.
-- CRC-8 validation (Dallas polynomial 0x8C) on ROM codes
-
-### Power supply
-
-- Use `set_psu_enable(voltage_mv, current_ma)` to power on
-- Use `set_psu_disable()` to power off -- `set_psu_enable(voltage_mv=0)` does NOT disable the PSU
-- Power cycle the target between configuration changes; the BP6 may hold stale UART state otherwise
-- If the BP6 becomes unresponsive (stale connection, timeout on status_request), a USB replug is the most reliable recovery
-
-### GPIO for download mode
-
-Free IO pins (IO0-IO3, IO6-IO7) can be used for GPIO control while UART mode is active on IO4/IO5. Use `set_pin_output()` and `release_pin()` in hardware.py. This enables automated bootloader entry (hold boot pin low, pulse reset).
-
-**Important:** BPIO2 (ACM1) and terminal bridge mode (ACM0) cannot operate simultaneously. The firmware locks up. Use BPIO2 for GPIO setup, then switch to terminal for bridge mode.
-
-### Follow Along Logic Analyzer (FALA)
-
-FALA (binmode 4) auto-captures bus activity on all 8 IO pins every time a bus command runs on the terminal. It runs alongside active bus commands, providing raw signal capture.
-
-- FALA uses ACM1 for capture data while bus commands run on ACM0 (terminal)
-- Binmode switch: BPIO2 (2) -> FALA (4) -> BPIO2 (2), all via terminal, no USB replug
-- Notification format: `$FALADATA;8;0;0;N;75000000;7468;0;` (semicolon-delimited)
-- Raw dump via `+` on ACM1: 1 byte per sample, 8 channels per bit, 75 MHz sample rate
-- `la.py` is the ONLY module that manages FALA serial ports (same pattern as hardware.py for BPIO2)
-- `la_parsers.py` handles signal analysis and protocol identification
-
-FALA and BPIO2 are mutually exclusive (both use ACM1). Close all BPIO2 sessions before switching to FALA.
-
-### Flash dumping via UART bridge
-
-The BP6 `bridge` command creates a transparent serial passthrough on ACM0. esptool.py can read/write flash through this bridge using `--before no-reset --after no-reset --no-stub`. Baud rates above 460800 risk buffer overruns in bridge mode.
-
-**After a flash dump, bridge mode stays active.** It cannot be exited programmatically. Press the physical button on the BP6 or USB-replug to exit bridge and restore normal BPIO2 operation.
-
-### USB CDC ports
-
-The BP6 exposes two USB CDC serial ports:
-- ACM0: text terminal (VT100), also used for UART bridge mode
-- ACM1: binary protocol (BPIO2)
-
-The binary port number may change after USB replug (ACM1 -> ACM2 etc). The MCP server auto-detects the correct port.
-
-User must be in the `dialout` group for serial access. A new shell or re-login is required after `usermod -aG dialout $USER`.
+- Console port: /dev/ttyACM0 (user needs `dialout` group).
+- No PSU on this board: set_voltage/set_power raise PSUUnavailableError;
+  tools return `psu: unavailable`. Power the target from the bench supply.
+- No FALA logic analyzer: verify_connection uses DIO `measure`
+  (edge counter + approximate frequency), not ADC voltage.
+- S3 strapping/reserved pins are rejected by `_validate_pin` (3, 19, 20,
+  22-37, 45, 46).
+- SPI pin map is NVS-persisted by the firmware; `spi_config` re-points it
+  (7-prompt walk). Typical Bit-Pirate defaults: MOSI 40, MISO 39, SCLK 41,
+  CS 4, 20 MHz, WP 7.
+- `bridge` (UART passthrough for esptool) is persistent: exit requires the
+  physical button or a USB replug.
 
 ## Build and Run
 
 ```bash
-# First time: clone submodules
-git submodule update --init
-
-# Install
-pip install -e ".[dev]"
-
-# Run server (stdio transport, spawned by MCP client)
-python -m buspirate_mcp
-
-# Tests (no hardware needed)
-pytest
-
-# Integration tests (BusPirate must be connected)
-pytest tests/ -m hardware
+python3 -m venv .venv            # or: uv venv --python 3.11 .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m buspirate_mcp          # stdio server (spawned by MCP client)
+.venv/bin/python -m pytest                 # 221 tests, no hardware needed
+.venv/bin/python scripts/smoke_live.py     # live DIO smoke test (board attached)
+.venv/bin/python scripts/smoke_live_spi.py # live SPI shell smoke test (read-only)
 ```
 
 ## Style
 
-- Python 3.11+
+- Python 3.11+ (mcp pinned <2.0; 2.x removed the legacy Server API)
 - No emojis, no em-dashes in code, comments, commits, or docs
 - Commit messages: short, to the point
+- Tests: transcript-driven (FakeSerial protocol mock in
+  tests/test_bitpirate_hardware.py, imported by the SPI test module). The
+  mock is a FIFO of (line, response) pairs; responses release only after the
+  triggering line is written; raw bytes are supported for the dump path.
