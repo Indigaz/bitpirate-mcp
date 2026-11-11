@@ -32,6 +32,11 @@ from buspirate_mcp.tools import (
     tool_spi_dump,
     tool_spi_write,
     tool_spi_transfer,
+    tool_spi_config,
+    tool_spi_flash_analyze,
+    tool_spi_flash_search,
+    tool_spi_flash_strings,
+    tool_spi_flash_erase,
     tool_close_spi,
     _ascii_score,
     _onewire_crc8,
@@ -649,529 +654,197 @@ class TestClose1Wire:
 
 
 # ---------------------------------------------------------------------------
-# SPI tool tests
+# SPI tool tests (ESP32-Bit-Pirate native flash shell)
 # ---------------------------------------------------------------------------
 
 
 class TestOpenSPI:
     @pytest.mark.asyncio
-    async def test_creates_session(self, tmp_path):
+    async def test_creates_session_and_switches_mode(self, tmp_path):
         mgr = SessionManager(engagements_dir=tmp_path)
         mock_hw = MagicMock()
+        mock_hw._active_mode = "hiz"
         result = await tool_open_spi(
-            session_manager=mgr,
-            hardware=mock_hw,
-            engagement_name="test-flash",
+            session_manager=mgr, hardware=mock_hw, engagement_name="test",
         )
-        assert "session_id" in result
-        assert "engagement_path" in result
-        mock_hw.configure_spi.assert_called_once_with(
-            speed=1_000_000,
-            clock_polarity=False,
-            clock_phase=False,
-            chip_select_idle=True,
-            voltage_mv=None,
-            current_ma=None,
-        )
+        assert result["status"] == "open"
+        assert result["protocol"] == "spi"
+        mock_hw._set_mode.assert_called_once_with("spi")
 
     @pytest.mark.asyncio
-    async def test_returns_config(self, tmp_path):
+    async def test_no_mode_switch_when_already_spi(self, tmp_path):
         mgr = SessionManager(engagements_dir=tmp_path)
         mock_hw = MagicMock()
+        mock_hw._active_mode = "spi"
         result = await tool_open_spi(
-            session_manager=mgr,
-            hardware=mock_hw,
-            engagement_name="test-flash",
-            speed=2_000_000,
-            clock_polarity=True,
-            clock_phase=True,
-            chip_select_idle=False,
+            session_manager=mgr, hardware=mock_hw, engagement_name="test",
         )
-        cfg = result["spi_config"]
-        assert cfg["speed"] == 2_000_000
-        assert cfg["cpol"] is True
-        assert cfg["cpha"] is True
-        assert cfg["cs_idle"] is False
-
-    @pytest.mark.asyncio
-    async def test_session_protocol_is_spi(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-        result = await tool_open_spi(
-            session_manager=mgr,
-            hardware=mock_hw,
-            engagement_name="test-flash",
-        )
-        session = mgr.get(result["session_id"])
-        assert session.protocol == "spi"
+        assert result["status"] == "open"
+        mock_hw._set_mode.assert_not_called()
 
 
 class TestSPIProbe:
     @pytest.mark.asyncio
-    async def test_decodes_winbond_jedec(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_returns_probe_dict(self):
         mock_hw = MagicMock()
-
-        # JEDEC: Winbond W25Q128 (0xEF, 0x40, 0x18)
-        # Status: 0x00 (no protection)
-        mock_hw.spi_transfer.side_effect = [
-            [0xEF, 0x40, 0x18],  # JEDEC ID
-            [0x00],              # status register
-        ]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_probe(
-            session_manager=mgr, session_id=session.session_id,
-        )
-
-        assert result["jedec_id"] == "EF4018"
-        assert result["manufacturer"] == "Winbond"
-        assert result["device_type"] == "0x40"
-        assert result["capacity_bytes"] == 2 ** 0x18  # 16 MB
+        mock_hw.spi_flash_probe.return_value = {
+            "present": True, "id": "EF 40 18", "manufacturer": "Winbond",
+            "model": "W25Q128", "capacity_bytes": 16777216,
+        }
+        result = await tool_spi_probe(hardware=mock_hw)
+        assert result["present"] is True
+        assert result["id"] == "EF 40 18"
         assert result["capacity_human"] == "16 MB"
-        assert result["status_register"] == "0x00"
-        assert result["write_protected"] is False
-
-    @pytest.mark.asyncio
-    async def test_detects_write_protection(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-
-        mock_hw.spi_transfer.side_effect = [
-            [0xEF, 0x40, 0x18],
-            [0x0C],  # BP1 and BP0 set
-        ]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_probe(
-            session_manager=mgr, session_id=session.session_id,
-        )
-        assert result["write_protected"] is True
-
-    @pytest.mark.asyncio
-    async def test_unknown_manufacturer(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-
-        mock_hw.spi_transfer.side_effect = [
-            [0xFF, 0x00, 0x10],
-            [0x00],
-        ]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_probe(
-            session_manager=mgr, session_id=session.session_id,
-        )
-        assert "Unknown" in result["manufacturer"]
-
-    @pytest.mark.asyncio
-    async def test_bogus_jedec_capacity_capped_at_64mb(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-        # Capacity code 0xFF would be 2^255 bytes without the cap
-        mock_hw.spi_transfer.side_effect = [
-            [0xEF, 0x40, 0xFF],
-            [0x00],
-        ]
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_probe(
-            session_manager=mgr, session_id=session.session_id,
-        )
-        assert result["capacity_bytes"] == 64 * 1024 * 1024
-
-    @pytest.mark.asyncio
-    async def test_logs_both_transactions(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-
-        mock_hw.spi_transfer.side_effect = [
-            [0xEF, 0x40, 0x18],
-            [0x00],
-        ]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        await tool_spi_probe(
-            session_manager=mgr, session_id=session.session_id,
-        )
-
-        import json
-        log_file = session.engagement_path / "logs" / "spi-commands.jsonl"
-        lines = [json.loads(l) for l in log_file.read_text().splitlines() if l.strip()]
-        assert len(lines) == 2
-        assert lines[0]["operation"] == "jedec_id"
-        assert lines[1]["operation"] == "read_status"
 
 
 class TestSPIRead:
     @pytest.mark.asyncio
-    async def test_reads_and_saves_file(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_returns_hexdump(self):
         mock_hw = MagicMock()
-
-        # Return 64 bytes of pattern data per chunk
-        mock_hw.spi_transfer.return_value = list(range(64))
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_read(
-            session_manager=mgr,
-            session_id=session.session_id,
-            address=0x1000,
-            length=64,
-        )
-
-        assert result["bytes_read"] == 64
-        assert len(result["hex_preview"]) > 0
-        from pathlib import Path
-        assert Path(result["file_path"]).exists()
-        assert Path(result["file_path"]).stat().st_size == 64
-
-    @pytest.mark.asyncio
-    async def test_reads_in_chunks(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-
-        # 1024 bytes = 2 chunks of 512
-        mock_hw.spi_transfer.return_value = [0xAA] * 512
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_read(
-            session_manager=mgr,
-            session_id=session.session_id,
-            address=0,
-            length=1024,
-        )
-
-        assert result["bytes_read"] == 1024
-        assert mock_hw.spi_transfer.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_hex_preview_is_first_64_bytes(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-
-        mock_hw.spi_transfer.return_value = [0xDE] * 128
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_read(
-            session_manager=mgr,
-            session_id=session.session_id,
-            address=0,
-            length=128,
-        )
-
-        # 64 bytes = 128 hex chars
-        assert len(result["hex_preview"]) == 128
-        assert result["hex_preview"] == "de" * 64
+        mock_hw.spi_flash_read.return_value = "000000: 00 11 22\n"
+        result = await tool_spi_read(hardware=mock_hw, address=0, length=3)
+        assert result["hexdump"] == "000000: 00 11 22\n"
+        assert result["address"] == 0
+        mock_hw.spi_flash_read.assert_called_once_with(0, 3, timeout=120)
 
 
 class TestSPIDump:
     @pytest.mark.asyncio
-    async def test_dumps_with_explicit_size(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_dump_writes_file(self):
         mock_hw = MagicMock()
-
-        mock_hw.spi_transfer.return_value = [0xFF] * 512
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_dump(
-            session_manager=mgr,
-            session_id=session.session_id,
-            size=1024,
-        )
-
-        assert result["bytes_read"] == 1024
-        assert "elapsed_s" in result
-        assert "speed_kbps" in result
-        from pathlib import Path
-        assert Path(result["file_path"]).exists()
-        assert Path(result["file_path"]).stat().st_size == 1024
+        mock_hw.spi_flash_probe.return_value = {
+            "present": True, "capacity_bytes": 4096,
+        }
+        mock_hw._dump_timeout.return_value = 200.0
+        mock_hw.spi_flash_dump_raw.return_value = {
+            "path": "/tmp/d.bin", "size": 4096,
+        }
+        result = await tool_spi_dump(hardware=mock_hw, output_path="/tmp/d.bin")
+        assert result["size"] == 4096
+        assert result["capacity_bytes"] == 4096
 
     @pytest.mark.asyncio
-    async def test_auto_detects_size_from_jedec(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_dump_errors_without_chip(self):
         mock_hw = MagicMock()
-
-        call_count = [0]
-
-        def fake_transfer(write_data, read_bytes):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # JEDEC ID query: 2**10 = 1024 bytes
-                return [0xEF, 0x40, 0x0A]
-            return [0xFF] * read_bytes
-
-        mock_hw.spi_transfer.side_effect = fake_transfer
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_dump(
-            session_manager=mgr,
-            session_id=session.session_id,
-        )
-
-        assert result["bytes_read"] == 1024
-
-    @pytest.mark.asyncio
-    async def test_custom_output_filename(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-        mock_hw.spi_transfer.return_value = [0x00] * 512
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_dump(
-            session_manager=mgr,
-            session_id=session.session_id,
-            size=512,
-            output_filename="custom.bin",
-        )
-
-        assert result["file_path"].endswith("custom.bin")
-
-    @pytest.mark.asyncio
-    async def test_returns_error_when_size_unknown(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-        # JEDEC returns capacity exponent 0 -> size 0
-        mock_hw.spi_transfer.return_value = [0xFF, 0xFF, 0x00]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_dump(
-            session_manager=mgr,
-            session_id=session.session_id,
-        )
-
+        mock_hw.spi_flash_probe.return_value = {
+            "present": False, "capacity_bytes": 0,
+        }
+        result = await tool_spi_dump(hardware=mock_hw, output_path="/tmp/d.bin")
         assert "error" in result
+        mock_hw.spi_flash_dump_raw.assert_not_called()
 
 
 class TestSPIWrite:
     @pytest.mark.asyncio
-    async def test_writes_with_erase_and_verify(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_write_from_file(self, tmp_path):
+        f = tmp_path / "img.bin"
+        f.write_bytes(b"\xDE\xAD\xBE\xEF")
         mock_hw = MagicMock()
-
-        # Data to write: 128 bytes
-        input_file = tmp_path / "firmware.bin"
-        payload = bytes(range(128))
-        input_file.write_bytes(payload)
-
-        call_log = []
-
-        def fake_transfer(write_data, read_bytes):
-            call_log.append((write_data[:1], read_bytes))
-            # Write Enable -> no read
-            if write_data[0] == 0x06:
-                return []
-            # Chip Erase -> no read
-            if write_data[0] == 0xC7:
-                return []
-            # Read Status -> return WIP=1 first time, then WIP=0
-            if write_data[0] == 0x05:
-                # Use a counter to simulate busy then ready
-                if not hasattr(fake_transfer, '_status_count'):
-                    fake_transfer._status_count = 0
-                fake_transfer._status_count += 1
-                if fake_transfer._status_count % 2 == 1:
-                    return [0x01]  # WIP set
-                return [0x00]  # WIP clear
-            # Page Program -> no read
-            if write_data[0] == 0x02:
-                return []
-            # Read Data (verify) -> return the original payload
-            if write_data[0] == 0x03:
-                addr = (write_data[1] << 16) | (write_data[2] << 8) | write_data[3]
-                return list(payload[addr : addr + read_bytes])
-            return [0x00] * read_bytes
-
-        mock_hw.spi_transfer.side_effect = fake_transfer
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
+        mock_hw.spi_flash_write.return_value = "SPI Flash Write: Complete."
         result = await tool_spi_write(
-            session_manager=mgr,
-            session_id=session.session_id,
-            input_path=str(input_file),
+            hardware=mock_hw, address=0x1000, input_path=str(f),
         )
-
-        assert result["bytes_written"] == 128
-        assert result["erased"] is True
-        assert result["verified"] is True
-        assert "elapsed_s" in result
+        assert result["status"] == "written"
+        args, kwargs = mock_hw.spi_flash_write.call_args
+        assert args[0] == 0x1000
+        assert kwargs["data_hex"] == "DEADBEEF"
 
     @pytest.mark.asyncio
-    async def test_write_without_erase(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_write_requires_one_source(self):
         mock_hw = MagicMock()
-
-        input_file = tmp_path / "small.bin"
-        input_file.write_bytes(b"\xAA" * 16)
-
-        def fake_transfer(write_data, read_bytes):
-            if write_data[0] == 0x06:
-                return []
-            if write_data[0] == 0x02:
-                return []
-            if write_data[0] == 0x05:
-                return [0x00]  # always ready
-            if write_data[0] == 0x03:
-                return [0xAA] * read_bytes
-            return [0x00] * read_bytes
-
-        mock_hw.spi_transfer.side_effect = fake_transfer
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_write(
-            session_manager=mgr,
-            session_id=session.session_id,
-            input_path=str(input_file),
-            erase=False,
-        )
-
-        assert result["erased"] is False
-        assert result["verified"] is True
-
-    @pytest.mark.asyncio
-    async def test_verify_detects_mismatch(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
-        mock_hw = MagicMock()
-
-        input_file = tmp_path / "data.bin"
-        input_file.write_bytes(b"\xBB" * 16)
-
-        def fake_transfer(write_data, read_bytes):
-            if write_data[0] == 0x06:
-                return []
-            if write_data[0] == 0x02:
-                return []
-            if write_data[0] == 0x05:
-                return [0x00]
-            if write_data[0] == 0x03:
-                return [0xCC] * read_bytes  # wrong data
-            return []
-
-        mock_hw.spi_transfer.side_effect = fake_transfer
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_write(
-            session_manager=mgr,
-            session_id=session.session_id,
-            input_path=str(input_file),
-            erase=False,
-        )
-
-        assert result["verified"] is False
+        result = await tool_spi_write(hardware=mock_hw, address=0)
+        assert "error" in result
+        mock_hw.spi_flash_write.assert_not_called()
 
 
 class TestSPITransfer:
     @pytest.mark.asyncio
-    async def test_hex_conversion_both_ways(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_instruction_returns_rx(self):
         mock_hw = MagicMock()
-        mock_hw.spi_transfer.return_value = [0xDE, 0xAD]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
+        mock_hw.spi_instruction.return_value = b"\xEF\x40\x18"
         result = await tool_spi_transfer(
-            session_manager=mgr,
-            session_id=session.session_id,
-            write_hex="9f",
-            read_bytes=2,
+            hardware=mock_hw, instruction="[0x9F r:3]",
         )
-
-        assert result["tx"] == "9f"
-        assert result["rx"] == "dead"
-        assert result["bytes_read"] == 2
-        mock_hw.spi_transfer.assert_called_once_with([0x9F], 2)
+        assert result["rx_hex"] == "EF4018"
+        assert result["bytes_read"] == 3
 
     @pytest.mark.asyncio
-    async def test_write_only(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_write_only_instruction_empty(self):
         mock_hw = MagicMock()
-        mock_hw.spi_transfer.return_value = []
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        result = await tool_spi_transfer(
-            session_manager=mgr,
-            session_id=session.session_id,
-            write_hex="0600",
-            read_bytes=0,
-        )
-
-        assert result["rx"] == ""
+        mock_hw.spi_instruction.return_value = b""
+        result = await tool_spi_transfer(hardware=mock_hw, instruction="[0x06]")
+        assert result["rx_hex"] == ""
         assert result["bytes_read"] == 0
 
+
+class TestSPIConfig:
     @pytest.mark.asyncio
-    async def test_logs_transaction(self, tmp_path):
-        mgr = SessionManager(engagements_dir=tmp_path)
+    async def test_config_passes_pins(self):
         mock_hw = MagicMock()
-        mock_hw.spi_transfer.return_value = [0xAB]
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
+        result = await tool_spi_config(
+            hardware=mock_hw, mosi=40, miso=39, sclk=41, cs=4, freq_mhz=20,
         )
-        await tool_spi_transfer(
-            session_manager=mgr,
-            session_id=session.session_id,
-            write_hex="9f",
-            read_bytes=1,
+        assert result["configured"] is True
+        mock_hw.spi_config.assert_called_once_with(
+            40, 39, 41, 4, 20, wp=-1, hold=-1, timeout=15.0,
         )
 
-        import json
-        log_file = session.engagement_path / "logs" / "spi-commands.jsonl"
-        lines = [json.loads(l) for l in log_file.read_text().splitlines() if l.strip()]
-        assert len(lines) == 1
-        assert lines[0]["operation"] == "raw_transfer"
+
+class TestSPIFlashAnalyze:
+    @pytest.mark.asyncio
+    async def test_returns_transcript(self):
+        mock_hw = MagicMock()
+        mock_hw.spi_flash_analyze.return_value = "  SPI Flash Analyze: Done."
+        result = await tool_spi_flash_analyze(hardware=mock_hw)
+        assert "Done." in result["transcript"]
+
+
+class TestSPIFlashSearch:
+    @pytest.mark.asyncio
+    async def test_returns_matches(self):
+        mock_hw = MagicMock()
+        mock_hw.spi_flash_search.return_value = {
+            "pattern": "abc",
+            "matches": [{"address": "0x000010", "context": "x"}],
+            "transcript": "t",
+        }
+        result = await tool_spi_flash_search(hardware=mock_hw, pattern="abc")
+        assert result["matches"][0]["address"] == "0x000010"
+
+
+class TestSPIFlashStrings:
+    @pytest.mark.asyncio
+    async def test_returns_transcript(self):
+        mock_hw = MagicMock()
+        mock_hw.spi_flash_strings.return_value = "0x000010: hello\n"
+        result = await tool_spi_flash_strings(hardware=mock_hw, min_length=5)
+        assert "hello" in result["transcript"]
+        mock_hw.spi_flash_strings.assert_called_once_with(5, timeout=600)
+
+
+class TestSPIFlashErase:
+    @pytest.mark.asyncio
+    async def test_erase(self):
+        mock_hw = MagicMock()
+        mock_hw.spi_flash_erase.return_value = "SPI Flash Erase: Complete."
+        result = await tool_spi_flash_erase(hardware=mock_hw)
+        assert result["status"] == "erased"
 
 
 class TestCloseSPI:
     @pytest.mark.asyncio
-    async def test_closes_session_and_resets_mode(self, tmp_path):
+    async def test_close_exits_shell_and_hiz(self, tmp_path):
         mgr = SessionManager(engagements_dir=tmp_path)
         mock_hw = MagicMock()
-
-        session = mgr.create(
-            name="test", hardware=mock_hw, protocol="spi",
-        )
-        sid = session.session_id
+        mock_hw._active_mode = "spi"
+        session = mgr.create(name="t", hardware=mock_hw, protocol="spi")
         result = await tool_close_spi(
-            session_manager=mgr, session_id=sid, hardware=mock_hw,
+            session_manager=mgr, session_id=session.session_id,
+            hardware=mock_hw,
         )
-
         assert result["closed"] is True
-        assert result["session_id"] == sid
+        mock_hw._flash_exit.assert_called_once()
         mock_hw.reset_mode.assert_called_once()
-        with pytest.raises(KeyError):
-            mgr.get(sid)
 
 
 # ---------------------------------------------------------------------------

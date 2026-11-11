@@ -41,7 +41,9 @@ class FakeSerial:
     def __init__(self) -> None:
         self.tx: list[bytes] = []
         self._rx: list[bytes] = []
-        self._responses: dict[str, bytes] = {}
+        # FIFO of (line, response): repeated lines (e.g. "y"/"n") resolve
+        # in registration order, matching the firmware's prompt order.
+        self._responses: list[tuple[str, bytes]] = []
         self._pending_release = False
         self.timeout = 0.2
         self.closed = False
@@ -49,16 +51,19 @@ class FakeSerial:
     def queue_rx(self, data: str) -> None:
         self._rx.append(data.encode())
 
-    def expect(self, prefix: str, response: str) -> None:
-        self._responses[prefix] = response.encode()
+    def expect(self, line: str, response: str | bytes) -> None:
+        resp = response if isinstance(response, bytes) else response.encode()
+        self._responses.append((line, resp))
 
     def write(self, data: bytes) -> int:
         self.tx.append(data)
-        text = data.decode("ascii", "replace")
-        for prefix in list(self._responses):
-            if prefix in text:
-                self._rx.append(self._responses.pop(prefix))
+        line = data.decode("ascii", "replace").rstrip("\r\n")
+        for i, (key, resp) in enumerate(self._responses):
+            if key == line:
+                self._rx.append(resp)
+                del self._responses[i]
                 self._pending_release = True
+                break
         return len(data)
 
     def read(self, n: int) -> bytes:
@@ -261,10 +266,6 @@ def test_set_power_raises_psu_unavailable(hw):
         lambda h: h.configure_uart(speed=115200),
         lambda h: h.read(),
         lambda h: h.write(b"abc"),
-        lambda h: h.configure_spi(speed=1000000),
-        lambda h: h.spi_transfer(b"\x9f", 3),
-        lambda h: h.spi_select(),
-        lambda h: h.spi_deselect(),
         lambda h: h.configure_i2c(speed=400000),
         lambda h: h.i2c_transfer(b"\x50", 1),
         lambda h: h.i2c_scan(),

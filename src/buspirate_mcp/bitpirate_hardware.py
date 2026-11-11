@@ -59,6 +59,22 @@ RE_MEASURE_RISING: re.Pattern = re.compile(rb"Rising edges:\s+(\d+)")
 RE_MEASURE_FALLING: re.Pattern = re.compile(rb"Falling edges:\s+(\d+)")
 RE_MEASURE_FREQ: re.Pattern = re.compile(rb"Approx\. frequency: ([\d.]+) Hz")
 
+# -- SPI flash (v1.8 source: SpiFlashShell.cpp, UserInputManager.cpp) --
+SPI_MENU_MARK = b"=== SPI Flash Shell ==="
+DUMP_DONE_MARK = b"SPI Flash Dump: Done."
+NO_FLASH = b"No SPI flash detected"
+RAW_BYTES_PER_SECOND = 11520.0  # 115200 baud / 8, raw dump bottleneck
+
+RE_FLASH_ID = re.compile(rb"SPI Flash ID: ([0-9A-Fa-f]{2}) ([0-9A-Fa-f]{2}) ([0-9A-Fa-f]{2})")
+RE_FLASH_MFR = re.compile(rb"Manufacturer: (.+)")
+RE_FLASH_MODEL = re.compile(rb"Model: (.+)")
+RE_FLASH_CAP = re.compile(rb"Capacity: (\d+) bytes")
+RE_FLASH_MATCH = re.compile(rb"^(0x[0-9A-Fa-f]{1,6}): (.+)$", re.MULTILINE)
+RE_SPI_READ = re.compile(rb"SPI Read:\s*\n([0-9A-Fa-f ]+)")
+
+from pathlib import Path
+
+
 
 class PSUUnavailableError(RuntimeError):
     """Raised for PSU calls -- this board has no onboard power supply."""
@@ -84,6 +100,7 @@ class BitPirateHardware:
         self.baud: int = baud
         self.serial: serial.Serial | None = None
         self._active_mode: str | None = None
+        self._flash_shell_open: bool = False
         self._last_voltage_mv: int = 0
         self._last_current_ma: int = 0
 
@@ -177,6 +194,7 @@ class BitPirateHardware:
 
     def reset_mode(self) -> None:
         self._active_mode = None
+        self._flash_shell_open = False
 
     def _validate_pin(self, pin: int) -> None:
         if not isinstance(pin, int) or isinstance(pin, bool):
@@ -257,6 +275,262 @@ class BitPirateHardware:
         detector). Return None per upstream contract."""
         return None
 
+
+    # -- SPI / flash (Phase 2) --
+
+    def _wait_marker(self, marker: bytes, timeout: float) -> bytes:
+        """Read console until `marker` appears; return all bytes read.
+
+        Shell flows do not end at a mode prompt, so marker-based reads are
+        used instead of _read_until_prompt.
+        """
+        s = self._require_serial()
+        buf = b""
+        window = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = s.read(4096)
+            if not chunk:
+                continue
+            buf += chunk
+            window += chunk
+            if marker in window:
+                return buf
+            if len(window) > len(marker) - 1:
+                window = window[-(len(marker) - 1):]
+        raise BitPirateCLIError(
+            f"Timed out after {timeout:.0f}s waiting for {marker[:40]!r}",
+            buf.decode("utf-8", "replace")[-4000:],
+        )
+
+    def _spi(self, subcmd: str, *args: str) -> bytes:
+        if self._active_mode != "spi":
+            self._set_mode("spi")
+        return self._cmd(" ".join([subcmd, *args]))
+
+    def _flash_enter(self, timeout: float = 10.0) -> None:
+        if self._flash_shell_open:
+            return
+        if self._active_mode != "spi":
+            self._set_mode("spi")
+        self._send_line("flash")
+        self._wait_marker(SPI_MENU_MARK, timeout)
+        self._flash_shell_open = True
+
+    def _flash_exit(self, timeout: float = 10.0) -> bytes:
+        if not self._flash_shell_open:
+            return b""
+        self._send_line("10")
+        t = self._wait_marker(b"Exiting SPI Flash Shell", timeout)
+        self._flash_shell_open = False
+        return t
+
+    def _flash_menu(self, idx: int, timeout: float) -> bytes:
+        """Pick a shell action; read until the shell reprints its menu."""
+        self._send_line(str(idx))
+        return self._wait_marker(SPI_MENU_MARK, timeout)
+
+    def spi_config(
+        self,
+        mosi: int,
+        miso: int,
+        sclk: int,
+        cs: int,
+        freq_mhz: int,
+        wp: int = -1,
+        hold: int = -1,
+        timeout: float = 15.0,
+    ) -> bytes:
+        """Drive the 7-prompt config sequence (NVS-persisted by firmware)."""
+        for p in (mosi, miso, sclk, cs):
+            self._validate_pin(p)
+        for p in (wp, hold):
+            if p >= 0:
+                self._validate_pin(p)
+        if not 1 <= int(freq_mhz) <= 80:
+            raise ValueError(f"freq_mhz must be 1-80, got: {freq_mhz}")
+        if self._active_mode != "spi":
+            self._set_mode("spi")
+        self._send_line("config")
+        for label, val in (("MOSI", mosi), ("MISO", miso), ("SCLK", sclk), ("CS", cs)):
+            self._wait_marker((label + " GPIO [").encode(), timeout)
+            self._send_line(str(int(val)))
+        self._wait_marker(b"Frequency (MHz) [", timeout)
+        self._send_line(str(int(freq_mhz)))
+        self._wait_marker(b"Use WP or HOLD ? [", timeout)
+        if wp >= 0 or hold >= 0:
+            self._send_line("y")
+            self._wait_marker(b"WP GPIO [", timeout)
+            self._send_line(str(wp))
+            self._wait_marker(b"HOLD GPIO [", timeout)
+            self._send_line(str(hold))
+        else:
+            self._send_line("n")
+        return self._wait_marker(b"SPI configured.", timeout)
+
+    def spi_flash_probe(self, timeout: float = 15.0) -> dict:
+        self._flash_enter()
+        t = self._flash_menu(1, timeout)
+        out: dict = {
+            "present": False, "id": None, "manufacturer": None,
+            "model": None, "capacity_bytes": None,
+        }
+        m = RE_FLASH_ID.search(t)
+        if m:
+            out["id"] = " ".join(g.decode().upper() for g in m.groups())
+            out["present"] = m.group(1) not in (b"00", b"FF")
+        if NO_FLASH in t:
+            out["present"] = False
+        mm = RE_FLASH_MFR.search(t)
+        if mm:
+            out["manufacturer"] = mm.group(1).decode().strip()
+        mm = RE_FLASH_MODEL.search(t)
+        if mm:
+            out["model"] = mm.group(1).decode().strip()
+        c = RE_FLASH_CAP.search(t)
+        if c:
+            out["capacity_bytes"] = int(c.group(1))
+        return out
+
+    def spi_flash_analyze(self, timeout: float = 600.0) -> str:
+        """On-device BinaryAnalyzer: secrets, file signatures, summary."""
+        self._flash_enter()
+        t = self._flash_menu(2, timeout)
+        return t.decode("utf-8", "replace")
+
+    def spi_flash_search(self, pattern: str, timeout: float = 600.0) -> dict:
+        if not 1 <= len(pattern) <= 32:
+            raise ValueError(f"pattern must be 1-32 bytes, got {len(pattern)}")
+        self._flash_enter()
+        self._send_line("3")
+        self._wait_marker(b"Enter string search pattern: ", timeout)
+        self._send_line(pattern)
+        t = self._wait_marker(b"Search complete.", timeout)
+        matches = [
+            {"address": a.decode(), "context": c.decode()}
+            for a, c in RE_FLASH_MATCH.findall(t)
+        ]
+        return {
+            "pattern": pattern,
+            "matches": matches,
+            "transcript": t.decode("utf-8", "replace"),
+        }
+
+    def spi_flash_strings(self, min_length: int = 10, timeout: float = 600.0) -> str:
+        if not 2 <= int(min_length) <= 255:
+            raise ValueError(f"min_length must be 2-255, got: {min_length}")
+        self._flash_enter()
+        self._send_line("4")
+        self._wait_marker(b"Min. length of the strings: [", timeout)
+        self._send_line(str(int(min_length)))
+        t = self._wait_marker(b"SPI Flash: String extraction complete.", timeout)
+        return t.decode("utf-8", "replace")
+
+    def spi_flash_read(self, address: int, length: int, timeout: float = 120.0) -> str:
+        if not (0 <= address < 0x10000000):
+            raise ValueError(f"address must be 0-0xFFFFFF, got: {address:#x}")
+        if not (0 < length <= 0x10000):
+            raise ValueError(f"length must be 1-0x10000, got: {length}")
+        self._flash_enter()
+        self._send_line("5")
+        self._wait_marker(b"Start address (dec or 0x hex) [", timeout)
+        self._send_line(f"0x{address:X}")
+        self._wait_marker(b"Number of bytes to read (dec or 0x hex) [", timeout)
+        self._send_line(f"0x{length:X}")
+        t = self._wait_marker(SPI_MENU_MARK, timeout)
+        return t.decode("utf-8", "replace")
+
+    @staticmethod
+    def _dump_timeout(capacity_bytes: int) -> float:
+        """Raw dump is serial-bottlenecked (~11520 B/s at 115200 baud)."""
+        if capacity_bytes > 0:
+            return max(120.0, capacity_bytes / RAW_BYTES_PER_SECOND + 120.0)
+        return 1800.0
+
+    def spi_flash_dump_raw(
+        self,
+        output_path: str,
+        capacity_bytes: int = 0,
+        timeout: float | None = None,
+    ) -> dict:
+        """Dump RAW (menu 8): raw bytes streamed over the console."""
+        if timeout is None:
+            timeout = self._dump_timeout(capacity_bytes)
+        self._flash_enter()
+        self._send_line("8")
+        self._wait_marker(b"The raw mode is for python scripting, Continue? [", timeout)
+        self._send_line("y")
+        t = self._wait_marker(DUMP_DONE_MARK, timeout)
+        raw = t[: t.rfind(DUMP_DONE_MARK)]
+        if raw.endswith(b"\n"):
+            raw = raw[:-1]
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(raw)
+        return {"path": str(out), "size": len(raw)}
+
+    def spi_flash_write(
+        self,
+        address: int,
+        data_hex: str | None = None,
+        ascii_string: str | None = None,
+        auto_erase: bool = True,
+        timeout: float = 60.0,
+    ) -> str:
+        if (data_hex is None) == (ascii_string is None):
+            raise ValueError("Provide exactly one of data_hex or ascii_string")
+        if data_hex is not None and not data_hex.replace(" ", "").strip():
+            raise ValueError("data_hex is empty")
+        if data_hex is None:
+            assert ascii_string is not None
+            data = ascii_string.encode()
+        else:
+            data = bytes.fromhex(data_hex.replace(" ", ""))
+        if not data:
+            raise ValueError("empty write data")
+        if not (0 <= address < 0x10000000):
+            raise ValueError(f"address must be 0-0xFFFFFF, got: {address:#x}")
+        self._flash_enter()
+        self._send_line("6")
+        self._wait_marker(b"Start address (dec or 0x hex) [", timeout)
+        self._send_line(f"0x{address:X}")
+        self._wait_marker(b"Write an ASCII string? [", timeout)
+        if ascii_string is not None:
+            self._send_line("y")
+            self._wait_marker(b"Enter ASCII string (supports", timeout)
+            self._send_line(ascii_string)
+        else:
+            self._send_line("n")
+            self._wait_marker(b"Enter byte values (e.g., 01 A5 FF", timeout)
+            self._send_line(" ".join(f"{b:02X}" for b in data))
+        self._wait_marker(b"Automatically erase affected blocks", timeout)
+        self._send_line("y" if auto_erase else "n")
+        self._wait_marker(b"SPI Flash Write: Confirm write operation? [", timeout)
+        self._send_line("y")
+        t = self._wait_marker(b"SPI Flash Write: Complete.", timeout)
+        return t.decode("utf-8", "replace")
+
+    def spi_flash_erase(self, timeout: float = 1800.0) -> str:
+        """Erase ENTIRE chip (menu 9). Destructive."""
+        self._flash_enter()
+        self._send_line("9")
+        self._wait_marker(b"SPI Flash Erase: Erase entire flash memory? [", timeout)
+        self._send_line("y")
+        t = self._wait_marker(b"SPI Flash Erase: Complete.", timeout)
+        return t.decode("utf-8", "replace")
+
+    def spi_instruction(self, instruction: str, timeout: float = 15.0) -> bytes:
+        """BP6-style instruction syntax, e.g. '[0x9F r:3]' (JEDEC read)."""
+        if not 3 <= len(instruction) <= MAX_LINE_CHARS:
+            raise ValueError(
+                f"instruction must be 3-{MAX_LINE_CHARS} chars, got {len(instruction)}"
+            )
+        t = self._spi(instruction)
+        m = RE_SPI_READ.search(t)
+        if not m:
+            return b""  # write-only / no read-back
+        return bytes.fromhex(" ".join(m.group(1).decode().split()))
+
     # -- PSU (absent on this board) --
 
     def set_voltage(self, voltage_v: float, current_limit_ma: int) -> bool:
@@ -283,21 +557,6 @@ class BitPirateHardware:
     def write(self, data: bytes) -> None:
         raise NotImplementedError("bitpirate-mcp Phase 4: UART session")
 
-    def configure_spi(self, speed: int = 1000000, clock_polarity: bool = False,
-                      clock_phase: bool = False, chip_select_idle: bool = True,
-                      voltage_mv: int | None = None,
-                      current_ma: int | None = None) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 2: SPI session")
-
-    def spi_transfer(self, write_data: bytes, read_bytes: int = 0) -> bytes:
-        raise NotImplementedError("bitpirate-mcp Phase 2: SPI session")
-
-    def spi_select(self) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 2: SPI session")
-
-    def spi_deselect(self) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 2: SPI session")
-
     def configure_i2c(self, speed: int = 400000, clock_stretch: bool = False,
                       voltage_mv: int | None = None,
                       current_ma: int | None = None) -> None:
@@ -323,6 +582,10 @@ class BitPirateHardware:
 
     def disconnect(self) -> None:
         if self.serial is not None:
+            try:
+                self._flash_exit(timeout=3.0)
+            except Exception:
+                pass  # best effort -- board may already be unresponsive
             try:
                 self._cmd("mode hiz", timeout=3.0)
             except Exception:

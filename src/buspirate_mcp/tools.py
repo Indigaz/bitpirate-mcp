@@ -42,26 +42,6 @@ I2C_KNOWN_DEVICES = {
     range(0x38, 0x40): "Touch/Humidity (FT6236, HTU21D)",
 }
 
-# SPI flash commands (JEDEC standard)
-SPI_CMD_JEDEC_ID = 0x9F
-SPI_CMD_READ_STATUS = 0x05
-SPI_CMD_WRITE_ENABLE = 0x06
-SPI_CMD_READ_DATA = 0x03
-SPI_CMD_PAGE_PROGRAM = 0x02
-SPI_CMD_CHIP_ERASE = 0xC7
-SPI_STATUS_WIP = 0x01
-
-SPI_MANUFACTURERS = {
-    0xEF: "Winbond",
-    0xC2: "Macronix",
-    0x20: "Micron/Numonyx",
-    0xC8: "GigaDevice",
-    0x9D: "ISSI",
-    0x01: "Spansion/Cypress",
-    0xBF: "SST/Microchip",
-    0x1F: "Atmel/Microchip",
-    0x85: "Puya",
-}
 PROMPT_PATTERN = re.compile(r"^\s*[#$>\]]", re.MULTILINE)
 BAUD_SCAN_READ_TIME_S = 0.5
 SILENCE_THRESHOLD_S = 0.5
@@ -910,7 +890,7 @@ async def tool_close_i2c(
 
 
 # ---------------------------------------------------------------------------
-# SPI tools
+# SPI tools (ESP32-Bit-Pirate: native flash shell + instruction syntax)
 # ---------------------------------------------------------------------------
 
 
@@ -923,342 +903,183 @@ def _human_size(n: int) -> str:
     return f"{n} B"
 
 
-# Cap JEDEC-derived sizes to 64 MB. Capacity code > 26 (2^26) is almost
-# always a bogus read on a disconnected or misbehaving chip, not a real
-# 128 MB+ device. Without this cap, a bad byte causes a multi-GB allocation.
-SPI_MAX_CAPACITY_BYTES = 64 * 1024 * 1024
-
-
-def _jedec_capacity_bytes(capacity_code: int) -> int:
-    """Convert JEDEC capacity byte (jedec_bytes[2]) to bytes, capped at 64MB."""
-    if capacity_code <= 0:
-        return 0
-    size = 1 << capacity_code
-    if size > SPI_MAX_CAPACITY_BYTES:
-        return SPI_MAX_CAPACITY_BYTES
-    return size
-
-
 async def tool_open_spi(
     session_manager: SessionManager,
     hardware: Any,
     engagement_name: str,
-    speed: int = 1_000_000,
-    clock_polarity: bool = False,
-    clock_phase: bool = False,
-    chip_select_idle: bool = True,
-    voltage_mv: int | None = None,
-    current_ma: int | None = None,
     engagement_path: str | None = None,
 ) -> dict[str, Any]:
-    """Configure SPI mode on the BusPirate and create an engagement session."""
-    hardware.configure_spi(
-        speed=speed,
-        clock_polarity=clock_polarity,
-        clock_phase=clock_phase,
-        chip_select_idle=chip_select_idle,
-        voltage_mv=voltage_mv,
-        current_ma=current_ma,
-    )
+    """Enter SPI mode on the ESP32-Bit-Pirate and create an engagement session."""
+    if getattr(hardware, "_active_mode", None) != "spi":
+        hardware._set_mode("spi")
     session = session_manager.create(
         name=engagement_name,
         hardware=hardware,
         protocol="spi",
-        protocol_config={
-            "speed": speed,
-            "cpol": clock_polarity,
-            "cpha": clock_phase,
-        },
+        protocol_config={},
         engagement_path=engagement_path,
     )
     return {
+        "status": "open",
         "session_id": session.session_id,
-        "engagement_path": str(session.engagement_path),
-        "spi_config": {
-            "speed": speed,
-            "cpol": clock_polarity,
-            "cpha": clock_phase,
-            "cs_idle": chip_select_idle,
-        },
+        "protocol": "spi",
+        "hint": (
+            "Pin map comes from NVS (run spi_config to change it). "
+            "Use spi_probe to detect the flash, spi_instruction for raw "
+            "[0x..] transactions, or the spi_flash_* tools for the shell."
+        ),
     }
 
 
-async def tool_spi_probe(
-    session_manager: SessionManager,
-    session_id: str,
-) -> dict[str, Any]:
-    """Read JEDEC ID and status register from the SPI flash chip."""
-    session = session_manager.get(session_id)
-    hw = session.hardware
-
-    # JEDEC ID: send 0x9F, read 3 bytes (manufacturer, type, capacity)
-    jedec = hw.spi_transfer([SPI_CMD_JEDEC_ID], 3)
-    jedec_bytes = bytes(jedec)
-    session.log_transaction(
-        "jedec_id",
-        write_hex=f"{SPI_CMD_JEDEC_ID:02x}",
-        read_hex=jedec_bytes.hex(),
-    )
-
-    # Status register: send 0x05, read 1 byte
-    status = hw.spi_transfer([SPI_CMD_READ_STATUS], 1)
-    status_byte = bytes(status)[0]
-    session.log_transaction(
-        "read_status",
-        write_hex=f"{SPI_CMD_READ_STATUS:02x}",
-        read_hex=f"{status_byte:02x}",
-    )
-
-    manufacturer = SPI_MANUFACTURERS.get(
-        jedec_bytes[0], f"Unknown (0x{jedec_bytes[0]:02X})"
-    )
-    capacity_bytes = _jedec_capacity_bytes(jedec_bytes[2])
-
-    return {
-        "jedec_id": jedec_bytes.hex().upper(),
-        "manufacturer": manufacturer,
-        "device_type": f"0x{jedec_bytes[1]:02X}",
-        "capacity_bytes": capacity_bytes,
-        "capacity_human": _human_size(capacity_bytes),
-        "status_register": f"0x{status_byte:02X}",
-        "write_protected": bool(status_byte & 0x0C),
-    }
+async def tool_spi_probe(hardware: Any) -> dict[str, Any]:
+    """Detect the SPI flash chip via the firmware flash shell (menu 1)."""
+    r = hardware.spi_flash_probe()
+    result = dict(r)
+    if r.get("capacity_bytes"):
+        result["capacity_human"] = _human_size(r["capacity_bytes"])
+    return result
 
 
 async def tool_spi_read(
-    session_manager: SessionManager,
-    session_id: str,
+    hardware: Any,
     address: int,
     length: int,
+    timeout: int = 120,
 ) -> dict[str, Any]:
-    """Read a region of SPI flash memory."""
-    session = session_manager.get(session_id)
-    hw = session.hardware
-    chunk_size = 512
-    collected = bytearray()
-
-    remaining = length
-    addr = address
-    while remaining > 0:
-        n = min(chunk_size, remaining)
-        cmd = [
-            SPI_CMD_READ_DATA,
-            (addr >> 16) & 0xFF,
-            (addr >> 8) & 0xFF,
-            addr & 0xFF,
-        ]
-        data = hw.spi_transfer(cmd, n)
-        collected.extend(data)
-        addr += n
-        remaining -= n
-
-    # Save to artifacts
-    artifacts_dir = session.engagement_path / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    out_path = artifacts_dir / f"spi_read_{address:06x}_{length}.bin"
-    out_path.write_bytes(bytes(collected))
-
-    session.log_transaction(
-        "read_data",
-        write_hex=f"03 {address:06x}",
-        read_hex=f"{len(collected)} bytes",
-        metadata={"address": address, "length": length},
-    )
-
-    hex_preview = bytes(collected[:64]).hex()
+    """Read a region of SPI flash (hexdump, menu 5)."""
+    transcript = hardware.spi_flash_read(address, length, timeout=timeout)
     return {
-        "bytes_read": len(collected),
-        "hex_preview": hex_preview,
-        "file_path": str(out_path),
+        "address": address,
+        "length": length,
+        "hexdump": transcript,
     }
 
 
 async def tool_spi_dump(
-    session_manager: SessionManager,
-    session_id: str,
-    size: int | None = None,
-    output_filename: str = "flash_dump.bin",
-    chunk_size: int = 512,
+    hardware: Any,
+    output_path: str,
+    timeout: int | None = None,
 ) -> dict[str, Any]:
-    """Dump the entire SPI flash to a file."""
-    session = session_manager.get(session_id)
-    hw = session.hardware
-
-    # Auto-detect size via JEDEC ID if not provided
-    if size is None:
-        jedec = hw.spi_transfer([SPI_CMD_JEDEC_ID], 3)
-        jedec_bytes = bytes(jedec)
-        size = _jedec_capacity_bytes(jedec_bytes[2])
-        if size == 0:
-            return {
-                "error": "Could not auto-detect flash size. "
-                "Provide size explicitly.",
-            }
-
-    artifacts_dir = session.engagement_path / "artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(output_filename).name
-    out_path = artifacts_dir / safe_name
-
-    collected = bytearray()
-    addr = 0
-    t0 = time.monotonic()
-
-    while addr < size:
-        n = min(chunk_size, size - addr)
-        cmd = [
-            SPI_CMD_READ_DATA,
-            (addr >> 16) & 0xFF,
-            (addr >> 8) & 0xFF,
-            addr & 0xFF,
-        ]
-        data = hw.spi_transfer(cmd, n)
-        collected.extend(data)
-        addr += n
-
-    elapsed = time.monotonic() - t0
-    out_path.write_bytes(bytes(collected))
-
-    speed_kbps = (len(collected) / 1024) / elapsed if elapsed > 0 else 0.0
-
-    session.log_transaction(
-        "dump",
-        write_hex="full flash",
-        read_hex=f"{len(collected)} bytes",
-        metadata={
-            "size": size,
-            "elapsed_s": round(elapsed, 3),
-            "speed_kbps": round(speed_kbps, 1),
-        },
-    )
-
+    """Dump the entire SPI flash to a file (raw mode, menu 8)."""
+    probe = hardware.spi_flash_probe()
+    capacity = probe.get("capacity_bytes") or 0
+    if not probe.get("present"):
+        return {
+            "error": "No SPI flash detected (bus error or missing chip). "
+            "Check wiring and config first.",
+        }
+    if timeout is None:
+        timeout = int(hardware._dump_timeout(capacity))
+    r = hardware.spi_flash_dump_raw(output_path, capacity_bytes=capacity,
+                                    timeout=float(timeout))
     return {
-        "bytes_read": len(collected),
-        "elapsed_s": round(elapsed, 3),
-        "speed_kbps": round(speed_kbps, 1),
-        "file_path": str(out_path),
+        "path": r["path"],
+        "size": r["size"],
+        "size_human": _human_size(r["size"]),
+        "capacity_bytes": capacity,
     }
 
 
 async def tool_spi_write(
-    session_manager: SessionManager,
-    session_id: str,
-    input_path: str,
-    erase: bool = True,
-    verify: bool = True,
+    hardware: Any,
+    address: int,
+    input_path: str | None = None,
+    data_hex: str | None = None,
+    ascii_string: str | None = None,
+    auto_erase: bool = True,
+    timeout: int = 120,
 ) -> dict[str, Any]:
-    """Write a binary file to SPI flash. Optionally erases first and verifies."""
-    session = session_manager.get(session_id)
-    hw = session.hardware
-
-    data = Path(input_path).read_bytes()
-    t0 = time.monotonic()
-
-    # Chip erase
-    if erase:
-        hw.spi_transfer([SPI_CMD_WRITE_ENABLE], 0)
-        hw.spi_transfer([SPI_CMD_CHIP_ERASE], 0)
-        # Poll WIP bit until erase completes (120s deadline for damaged chips)
-        erase_deadline = time.monotonic() + 120
-        while True:
-            if time.monotonic() > erase_deadline:
-                return {"error": "Chip erase timeout: WIP bit stuck after 120s"}
-            status = hw.spi_transfer([SPI_CMD_READ_STATUS], 1)
-            if not (bytes(status)[0] & SPI_STATUS_WIP):
-                break
-            await asyncio.sleep(0.1)
-        session.log_transaction("chip_erase", write_hex="06 c7", read_hex="done")
-
-    # Page program (256-byte pages)
-    page_size = 256
-    addr = 0
-    while addr < len(data):
-        page = data[addr : addr + page_size]
-        hw.spi_transfer([SPI_CMD_WRITE_ENABLE], 0)
-        cmd = [
-            SPI_CMD_PAGE_PROGRAM,
-            (addr >> 16) & 0xFF,
-            (addr >> 8) & 0xFF,
-            addr & 0xFF,
-        ] + list(page)
-        hw.spi_transfer(cmd, 0)
-        # Poll WIP (5s deadline per page)
-        page_deadline = time.monotonic() + 5
-        while True:
-            if time.monotonic() > page_deadline:
-                return {
-                    "error": f"Page program timeout at addr 0x{addr:06x}: WIP bit stuck after 5s"
-                }
-            status = hw.spi_transfer([SPI_CMD_READ_STATUS], 1)
-            if not (bytes(status)[0] & SPI_STATUS_WIP):
-                break
-            await asyncio.sleep(0.01)
-        addr += page_size
-
-    session.log_transaction(
-        "page_program",
-        write_hex=f"{len(data)} bytes",
-        read_hex="",
-        metadata={"pages": (len(data) + page_size - 1) // page_size},
+    """Write data to SPI flash (menu 6). Exactly one data source required."""
+    sources = sum(x is not None for x in (input_path, data_hex, ascii_string))
+    if sources != 1:
+        return {
+            "error": "Provide exactly one of input_path, data_hex, or "
+            "ascii_string",
+        }
+    if input_path is not None:
+        data = Path(input_path).read_bytes()
+        data_hex = data.hex().upper()
+        ascii_string = None
+    result = hardware.spi_flash_write(
+        address,
+        data_hex=data_hex,
+        ascii_string=ascii_string,
+        auto_erase=auto_erase,
+        timeout=float(timeout),
     )
-
-    # Verify
-    verified = False
-    if verify:
-        read_back = bytearray()
-        addr = 0
-        while addr < len(data):
-            n = min(512, len(data) - addr)
-            cmd = [
-                SPI_CMD_READ_DATA,
-                (addr >> 16) & 0xFF,
-                (addr >> 8) & 0xFF,
-                addr & 0xFF,
-            ]
-            chunk = hw.spi_transfer(cmd, n)
-            read_back.extend(chunk)
-            addr += n
-        verified = bytes(read_back[: len(data)]) == data
-        session.log_transaction(
-            "verify",
-            write_hex="read-back compare",
-            read_hex="match" if verified else "MISMATCH",
-        )
-
-    elapsed = time.monotonic() - t0
-    return {
-        "bytes_written": len(data),
-        "erased": erase,
-        "verified": verified if verify else None,
-        "elapsed_s": round(elapsed, 3),
-    }
+    return {"status": "written", "address": address, "transcript": result}
 
 
 async def tool_spi_transfer(
-    session_manager: SessionManager,
-    session_id: str,
-    write_hex: str,
-    read_bytes: int = 0,
+    hardware: Any,
+    instruction: str,
+    timeout: int = 15,
 ) -> dict[str, Any]:
-    """Send a raw SPI transaction."""
-    session = session_manager.get(session_id)
-    hw = session.hardware
-
-    tx_data = list(bytes.fromhex(write_hex))
-    rx_data = hw.spi_transfer(tx_data, read_bytes)
-    rx_hex = bytes(rx_data).hex() if rx_data else ""
-
-    session.log_transaction(
-        "raw_transfer",
-        write_hex=write_hex,
-        read_hex=rx_hex,
-    )
-
+    """Run a BP6-style SPI instruction, e.g. '[0x9F r:3]' (JEDEC read)."""
+    rx = hardware.spi_instruction(instruction, timeout=float(timeout))
     return {
-        "tx": write_hex,
-        "rx": rx_hex,
-        "bytes_read": len(rx_data) if rx_data else 0,
+        "instruction": instruction,
+        "rx_hex": rx.hex().upper() if rx else "",
+        "bytes_read": len(rx),
     }
+
+
+async def tool_spi_config(
+    hardware: Any,
+    mosi: int,
+    miso: int,
+    sclk: int,
+    cs: int,
+    freq_mhz: int,
+    wp: int = -1,
+    hold: int = -1,
+    timeout: int = 15,
+) -> dict[str, Any]:
+    """Set the SPI pin map (NVS-persisted by the firmware)."""
+    hardware.spi_config(mosi, miso, sclk, cs, freq_mhz, wp=wp, hold=hold,
+                        timeout=float(timeout))
+    return {
+        "configured": True,
+        "mosi": mosi, "miso": miso, "sclk": sclk, "cs": cs,
+        "freq_mhz": freq_mhz, "wp": wp, "hold": hold,
+    }
+
+
+async def tool_spi_flash_analyze(
+    hardware: Any,
+    timeout: int = 600,
+) -> dict[str, Any]:
+    """On-device BinaryAnalyzer: file signatures, secret patterns, summary."""
+    transcript = hardware.spi_flash_analyze(timeout=float(timeout))
+    return {"transcript": transcript}
+
+
+async def tool_spi_flash_search(
+    hardware: Any,
+    pattern: str,
+    timeout: int = 600,
+) -> dict[str, Any]:
+    """Search the flash for a string pattern (1-32 bytes)."""
+    return hardware.spi_flash_search(pattern, timeout=float(timeout))
+
+
+async def tool_spi_flash_strings(
+    hardware: Any,
+    min_length: int = 10,
+    timeout: int = 600,
+) -> dict[str, Any]:
+    """Extract printable strings from the whole flash."""
+    transcript = hardware.spi_flash_strings(min_length, timeout=float(timeout))
+    return {"transcript": transcript}
+
+
+async def tool_spi_flash_erase(
+    hardware: Any,
+    timeout: int = 1800,
+) -> dict[str, Any]:
+    """Erase the ENTIRE flash chip (destructive, menu 9)."""
+    transcript = hardware.spi_flash_erase(timeout=float(timeout))
+    return {"status": "erased", "transcript": transcript}
 
 
 async def tool_close_spi(
@@ -1266,8 +1087,17 @@ async def tool_close_spi(
     session_id: str,
     hardware: Any,
 ) -> dict[str, Any]:
-    """Close an SPI session and reset the BusPirate mode."""
+    """Close an SPI session: exit the flash shell and return to HIZ mode."""
     session_manager.close(session_id)
+    try:
+        hardware._flash_exit(timeout=5.0)
+    except Exception:
+        pass
+    if getattr(hardware, "_active_mode", None) != "hiz":
+        try:
+            hardware._set_mode("hiz")
+        except Exception:
+            pass
     hardware.reset_mode()
     return {"closed": True, "session_id": session_id}
 

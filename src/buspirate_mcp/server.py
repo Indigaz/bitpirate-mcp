@@ -265,27 +265,21 @@ TOOL_DEFINITIONS = [
             "required": ["size", "output_path"],
         },
     ),
-    # --- SPI tools ---
+    # --- SPI tools (ESP32-Bit-Pirate: native flash shell + instruction syntax) ---
     Tool(
         name="open_spi",
         description=(
-            "Open an SPI connection and start an engagement. "
-            "Configures SPI mode on the ESP32-Bit-Pirate, creates engagement folder. "
-            "[allowed-write] [Duration: fast (~0.5-2 s -- mode switch + folder creation).]"
+            "Enter SPI mode on the ESP32-Bit-Pirate and start an engagement. "
+            "Pin map comes from NVS (change with spi_config). "
+            "[allowed-write] [Duration: fast (~1-2 s -- mode switch).]"
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "engagement_name": {"type": "string", "description": "Target device name"},
-                "speed": {"type": "integer", "default": 1000000, "description": "SPI clock speed in Hz"},
-                "clock_polarity": {"type": "boolean", "default": False, "description": "CPOL: clock idle state"},
-                "clock_phase": {"type": "boolean", "default": False, "description": "CPHA: data sampling edge"},
-                "chip_select_idle": {"type": "boolean", "default": True, "description": "CS idle state (true=high)"},
-                "voltage_mv": {"type": "integer", "description": "Target voltage in mV (optional, enables PSU)"},
-                "current_ma": {"type": "integer", "description": "Current limit in mA"},
                 "engagement_path": {
                     "type": "string",
-                    "description": "Path to an engagement folder (from project-mcp). If provided, writes to <engagement_path>/spi/ instead of creating a standalone engagement.",
+                    "description": "Path to an engagement folder (optional).",
                 },
             },
             "required": ["engagement_name"],
@@ -294,95 +288,171 @@ TOOL_DEFINITIONS = [
     Tool(
         name="spi_probe",
         description=(
-            "Read JEDEC ID and status register from an SPI flash chip. "
-            "Returns manufacturer, capacity, and write-protect status. "
-            "[read-only] [Duration: fast (~0.5-1 s -- JEDEC 0x9F sequence).]"
+            "Detect the SPI flash chip via the firmware flash shell. "
+            "Returns JEDEC ID, manufacturer, model, capacity, and capability notes. "
+            "[read-only] [Duration: fast (~2-5 s).]"
         ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-            },
-            "required": ["session_id"],
-        },
+        inputSchema={"type": "object", "properties": {}},
     ),
     Tool(
         name="spi_read",
         description=(
-            "Read a region of SPI flash memory starting at a given address. "
-            "Saves to artifacts. "
-            "[read-only] [Duration: fast for small reads; slow for large regions "
-            "(parameterized by length -- ~1 s per 4 KiB at 1 MHz).]"
+            "Read a region of SPI flash memory as a hexdump (firmware menu 5). "
+            "[read-only] [Duration: fast - slow (serial-bottlenecked ~11.5 KB/s "
+            "-- ~8 s per 100 KiB).]"
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
                 "address": {"type": "integer", "description": "Flash address to start reading from"},
-                "length": {"type": "integer", "description": "Number of bytes to read"},
+                "length": {"type": "integer", "description": "Number of bytes to read (max 65536)"},
+                "timeout": {"type": "integer", "default": 120, "description": "Timeout seconds"},
             },
-            "required": ["session_id", "address", "length"],
+            "required": ["address", "length"],
         },
     ),
     Tool(
         name="spi_dump",
         description=(
-            "Dump the entire SPI flash to a file. Auto-detects size from JEDEC ID "
-            "if not provided. "
-            "[read-only] [Duration: slow (~1-3 min for a typical 4-8 MiB flash at 1 MHz "
-            "with 512-byte chunks). Background-dispatch recommended.]"
+            "Dump the entire SPI flash to a file (firmware raw mode, menu 8). "
+            "Serial-bottlenecked (~91 s per MiB at 115200 baud). "
+            "[read-only] [Duration: slow - very-slow (4 MiB flash ~ 7 min). "
+            "Background-dispatch required.] Returns {path, size}."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
-                "size": {"type": "integer", "description": "Flash size in bytes (auto-detected if omitted)"},
-                "output_filename": {"type": "string", "default": "flash_dump.bin", "description": "Output filename"},
-                "chunk_size": {"type": "integer", "default": 512, "description": "Read chunk size in bytes"},
+                "output_path": {"type": "string", "description": "Destination file path (e.g. /home/christian/re-lab/<target>/flash.bin)"},
+                "timeout": {"type": "integer", "description": "Timeout seconds (auto from capacity if omitted)"},
             },
-            "required": ["session_id"],
+            "required": ["output_path"],
         },
     ),
     Tool(
         name="spi_write",
         description=(
-            "Write a binary file to SPI flash. Optionally erases first and verifies. "
-            "DANGEROUS: overwrites flash contents irreversibly. "
-            "[approval-write] [Duration: slow (~1-5 min -- chip erase + page program "
-            "+ optional verify; parameterized by image size). Background-dispatch recommended.]"
+            "Write data to SPI flash (firmware menu 6): from a file, hex string, "
+            "or ASCII string. DANGEROUS: overwrites flash. "
+            "[approval-write] [Duration: fast - slow (depends on size).]"
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
+                "address": {"type": "integer", "description": "Target flash address"},
                 "input_path": {"type": "string", "description": "Path to binary file to write"},
-                "erase": {"type": "boolean", "default": True, "description": "Chip erase before write"},
-                "verify": {"type": "boolean", "default": True, "description": "Read-back verify after write"},
+                "data_hex": {"type": "string", "description": "Hex string (e.g. 'DEADBEEF')"},
+                "ascii_string": {"type": "string", "description": "ASCII string to write"},
+                "auto_erase": {"type": "boolean", "default": True, "description": "Automatically erase affected blocks"},
                 "_confirmed": {"type": "boolean", "default": False, "description": "Set true to confirm execution"},
             },
-            "required": ["session_id", "input_path"],
+            "required": ["address", "_confirmed"],
         },
         annotations={"destructiveHint": True, "readOnlyHint": False},
     ),
     Tool(
         name="spi_transfer",
         description=(
-            "Send a raw SPI transaction. Write hex bytes and optionally read back. "
-            "[read-only] [Duration: instant.]"
+            "Run a BP6-style SPI instruction, e.g. '[0x9F r:3]' (JEDEC read), "
+            "'[0x05 r:1]' (status), '[0x06] [0xC7]' (enable + chip erase). "
+            "Dispatched to the firmware's instruction parser in SPI mode. "
+            "[read-only for read-only instructions] [Duration: instant - fast.]"
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "session_id": {"type": "string"},
-                "write_hex": {"type": "string", "description": "Hex string of bytes to send (e.g. '9F')"},
-                "read_bytes": {"type": "integer", "default": 0, "description": "Number of bytes to read back"},
+                "instruction": {"type": "string", "description": "Instruction in [0x.. r:N d:ms] syntax"},
+                "timeout": {"type": "integer", "default": 15, "description": "Timeout seconds"},
             },
-            "required": ["session_id", "write_hex"],
+            "required": ["instruction"],
         },
     ),
     Tool(
+        name="spi_config",
+        description=(
+            "Set the SPI pin map (MOSI/MISO/SCLK/CS GPIO, frequency 1-80 MHz, "
+            "optional WP/HOLD pins). NVS-persisted by the firmware. "
+            "[allowed-write] [Duration: fast (~2-4 s).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "mosi": {"type": "integer", "description": "MOSI GPIO"},
+                "miso": {"type": "integer", "description": "MISO GPIO"},
+                "sclk": {"type": "integer", "description": "SCLK GPIO"},
+                "cs": {"type": "integer", "description": "CS GPIO"},
+                "freq_mhz": {"type": "integer", "description": "SPI clock 1-80 MHz"},
+                "wp": {"type": "integer", "default": -1, "description": "WP GPIO or -1"},
+                "hold": {"type": "integer", "default": -1, "description": "HOLD GPIO or -1"},
+            },
+            "required": ["mosi", "miso", "sclk", "cs", "freq_mhz"],
+        },
+    ),
+    Tool(
+        name="spi_flash_analyze",
+        description=(
+            "Run the on-device BinaryAnalyzer over the whole flash: file "
+            "signatures, sensitive patterns (keys, hashes, URLs), entropy "
+            "summary. [read-only] [Duration: slow - very-slow (full-chip read "
+            "~91 s/MiB + analysis). Background-dispatch recommended.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "timeout": {"type": "integer", "default": 600, "description": "Timeout seconds"},
+            },
+        },
+    ),
+    Tool(
+        name="spi_flash_search",
+        description=(
+            "Search the flash for a string pattern (1-32 bytes). Returns match "
+            "addresses with printable context. [read-only] [Duration: slow "
+            "(full-chip read ~91 s/MiB). Background-dispatch recommended.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "String to search for (1-32 bytes)"},
+                "timeout": {"type": "integer", "default": 600, "description": "Timeout seconds"},
+            },
+            "required": ["pattern"],
+        },
+    ),
+    Tool(
+        name="spi_flash_strings",
+        description=(
+            "Extract printable strings from the whole flash (min length "
+            "parameter). [read-only] [Duration: slow - very-slow (full-chip "
+            "read). Background-dispatch recommended.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "min_length": {"type": "integer", "default": 10, "description": "Minimum string length"},
+                "timeout": {"type": "integer", "default": 600, "description": "Timeout seconds"},
+            },
+        },
+    ),
+    Tool(
+        name="spi_flash_erase",
+        description=(
+            "Erase the ENTIRE flash chip (firmware menu 9). DANGEROUS: all "
+            "contents destroyed. [approval-write] [Duration: slow - very-slow "
+            "(seconds to minutes depending on chip).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "_confirmed": {"type": "boolean", "default": False, "description": "Set true to confirm execution"},
+                "timeout": {"type": "integer", "default": 1800, "description": "Timeout seconds"},
+            },
+            "required": ["_confirmed"],
+        },
+        annotations={"destructiveHint": True, "readOnlyHint": False},
+    ),
+    Tool(
         name="close_spi",
-        description="Close an SPI session and reset the ESP32-Bit-Pirate to HiZ mode. [allowed-write] [Duration: instant.]",
+        description="Exit the flash shell and reset the ESP32-Bit-Pirate to HiZ mode. [allowed-write] [Duration: instant.]",
         inputSchema={
             "type": "object",
             "properties": {
@@ -719,53 +789,81 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 session_manager=session_manager,
                 hardware=hw,
                 engagement_name=arguments["engagement_name"],
-                speed=arguments.get("speed", 1_000_000),
-                clock_polarity=arguments.get("clock_polarity", False),
-                clock_phase=arguments.get("clock_phase", False),
-                chip_select_idle=arguments.get("chip_select_idle", True),
-                voltage_mv=arguments.get("voltage_mv"),
-                current_ma=arguments.get("current_ma"),
                 engagement_path=arguments.get("engagement_path"),
             )
 
         elif name == "spi_probe":
-            result = await tools.tool_spi_probe(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-            )
+            result = await tools.tool_spi_probe(hardware=_get_hardware())
 
         elif name == "spi_read":
             result = await tools.tool_spi_read(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
+                hardware=_get_hardware(),
                 address=arguments["address"],
                 length=arguments["length"],
+                timeout=arguments.get("timeout", 120),
             )
 
         elif name == "spi_dump":
             result = await tools.tool_spi_dump(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-                size=arguments.get("size"),
-                output_filename=arguments.get("output_filename", "flash_dump.bin"),
-                chunk_size=arguments.get("chunk_size", 512),
+                hardware=_get_hardware(),
+                output_path=arguments["output_path"],
+                timeout=arguments.get("timeout"),
             )
 
         elif name == "spi_write":
             result = await tools.tool_spi_write(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-                input_path=arguments["input_path"],
-                erase=arguments.get("erase", True),
-                verify=arguments.get("verify", True),
+                hardware=_get_hardware(),
+                address=arguments["address"],
+                input_path=arguments.get("input_path"),
+                data_hex=arguments.get("data_hex"),
+                ascii_string=arguments.get("ascii_string"),
+                auto_erase=arguments.get("auto_erase", True),
+                timeout=arguments.get("timeout", 120),
             )
 
         elif name == "spi_transfer":
             result = await tools.tool_spi_transfer(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-                write_hex=arguments["write_hex"],
-                read_bytes=arguments.get("read_bytes", 0),
+                hardware=_get_hardware(),
+                instruction=arguments["instruction"],
+                timeout=arguments.get("timeout", 15),
+            )
+
+        elif name == "spi_config":
+            result = await tools.tool_spi_config(
+                hardware=_get_hardware(),
+                mosi=arguments["mosi"],
+                miso=arguments["miso"],
+                sclk=arguments["sclk"],
+                cs=arguments["cs"],
+                freq_mhz=arguments["freq_mhz"],
+                wp=arguments.get("wp", -1),
+                hold=arguments.get("hold", -1),
+            )
+
+        elif name == "spi_flash_analyze":
+            result = await tools.tool_spi_flash_analyze(
+                hardware=_get_hardware(),
+                timeout=arguments.get("timeout", 600),
+            )
+
+        elif name == "spi_flash_search":
+            result = await tools.tool_spi_flash_search(
+                hardware=_get_hardware(),
+                pattern=arguments["pattern"],
+                timeout=arguments.get("timeout", 600),
+            )
+
+        elif name == "spi_flash_strings":
+            result = await tools.tool_spi_flash_strings(
+                hardware=_get_hardware(),
+                min_length=arguments.get("min_length", 10),
+                timeout=arguments.get("timeout", 600),
+            )
+
+        elif name == "spi_flash_erase":
+            result = await tools.tool_spi_flash_erase(
+                hardware=_get_hardware(),
+                timeout=arguments.get("timeout", 1800),
             )
 
         elif name == "close_spi":

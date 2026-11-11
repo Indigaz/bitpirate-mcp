@@ -9,6 +9,7 @@ class TestClassifyTool:
         for tool in [
             "list_devices", "verify_connection", "scan_baud", "read_output",
             "spi_probe", "spi_read", "spi_dump", "spi_transfer",
+            "spi_flash_analyze", "spi_flash_search", "spi_flash_strings",
             "i2c_scan", "i2c_read", "i2c_dump",
             "onewire_search", "onewire_read",
         ]:
@@ -18,14 +19,15 @@ class TestClassifyTool:
         for tool in [
             "open_uart", "send_command", "close_uart",
             "enter_download_mode", "read_flash",
-            "open_spi", "close_spi",
+            "open_spi", "close_spi", "spi_config",
             "open_i2c", "close_i2c",
             "open_1wire", "close_1wire",
         ]:
             assert classify_tool(tool) == SafetyTier.ALLOWED_WRITE
 
     def test_approval_write_tools(self):
-        for tool in ["set_voltage", "set_power", "spi_write", "i2c_write"]:
+        for tool in ["set_voltage", "set_power", "spi_write", "i2c_write",
+                     "spi_flash_erase"]:
             assert classify_tool(tool) == SafetyTier.APPROVAL_WRITE
 
     def test_unknown_tool_raises(self):

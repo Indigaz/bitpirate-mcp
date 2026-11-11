@@ -37,6 +37,11 @@ _TOOL_TIERS: dict[str, SafetyTier] = {
     "spi_write": SafetyTier.APPROVAL_WRITE,
     "spi_transfer": SafetyTier.READ_ONLY,
     "close_spi": SafetyTier.ALLOWED_WRITE,
+    "spi_config": SafetyTier.ALLOWED_WRITE,
+    "spi_flash_analyze": SafetyTier.READ_ONLY,
+    "spi_flash_search": SafetyTier.READ_ONLY,
+    "spi_flash_strings": SafetyTier.READ_ONLY,
+    "spi_flash_erase": SafetyTier.APPROVAL_WRITE,
     # I2C
     "open_i2c": SafetyTier.ALLOWED_WRITE,
     "i2c_scan": SafetyTier.READ_ONLY,
