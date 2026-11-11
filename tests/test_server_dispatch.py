@@ -49,11 +49,6 @@ TOOL_ARGS = {
     "onewire_search": {"session_id": "t"},
     "onewire_read": {"session_id": "t", "write_hex": "33", "read_bytes": 8},
     "close_1wire": {"session_id": "t"},
-    "la_prepare": {"engagement_name": "test", "protocol": "spi"},
-    "la_command": {"session_id": "t", "command": "[0x9f r:3]"},
-    "la_analyze": {"session_id": "t"},
-    "la_identify": {"session_id": "t"},
-    "la_cleanup": {"session_id": "t"},
 }
 
 
@@ -66,9 +61,9 @@ def _mock_globals():
         patch.object(server, "_hardware", mock_hw),
         patch.object(server, "_hardware_port", "/dev/ttyACM1"),
         patch("buspirate_mcp.server._get_hardware", return_value=mock_hw),
-        # read_flash calls BusPirateHardware.find_terminal_port() inline
+        # read_flash calls BitPirateHardware.find_terminal_port() inline
         patch(
-            "buspirate_mcp.server.BusPirateHardware.find_terminal_port",
+            "buspirate_mcp.server.BitPirateHardware.find_terminal_port",
             return_value="/dev/ttyACM0",
         ),
     ]

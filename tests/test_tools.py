@@ -3,6 +3,7 @@
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from buspirate_mcp.bitpirate_hardware import PSUUnavailableError
 from buspirate_mcp.tools import (
     tool_list_devices,
     tool_verify_connection,
@@ -34,7 +35,6 @@ from buspirate_mcp.tools import (
     tool_close_spi,
     _ascii_score,
     _onewire_crc8,
-    _validate_la_command,
 )
 from buspirate_mcp.session import SessionManager
 
@@ -61,7 +61,7 @@ class TestAsciiScore:
 class TestListDevices:
     @pytest.mark.asyncio
     async def test_returns_device_list(self):
-        with patch("buspirate_mcp.tools.BusPirateHardware") as mock_hw:
+        with patch("buspirate_mcp.tools.BitPirateHardware") as mock_hw:
             mock_hw.list_devices.return_value = [
                 {"path": "/dev/ttyACM0"},
                 {"path": "/dev/ttyACM1"},
@@ -71,7 +71,7 @@ class TestListDevices:
 
     @pytest.mark.asyncio
     async def test_returns_empty_with_hint(self):
-        with patch("buspirate_mcp.tools.BusPirateHardware") as mock_hw:
+        with patch("buspirate_mcp.tools.BitPirateHardware") as mock_hw:
             mock_hw.list_devices.return_value = []
             result = await tool_list_devices()
             assert result["devices"] == []
@@ -82,44 +82,51 @@ class TestVerifyConnection:
     @pytest.mark.asyncio
     async def test_detects_activity(self):
         mock_hw = MagicMock()
-        mock_hw.get_pin_voltages.side_effect = [
-            [0, 0, 0, 0, 3300, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
-            [0, 0, 0, 0, 3300, 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 0],
+        mock_hw.measure_pin.side_effect = [
+            {"rising": 10, "falling": 10, "frequency_hz": 10.0},
+            {"rising": 0, "falling": 0, "frequency_hz": 0.0},
         ]
         result = await tool_verify_connection(
             hardware=mock_hw, pins={"tx": 4, "rx": 5}, sample_duration_ms=100,
         )
         assert result["activity_detected"] is True
+        assert result["transitions"] == 20
 
     @pytest.mark.asyncio
     async def test_no_activity_on_quiescent_target(self):
         mock_hw = MagicMock()
-        mock_hw.get_pin_voltages.return_value = [0, 0, 0, 0, 3300, 0, 0, 0]
+        mock_hw.measure_pin.return_value = {
+            "rising": 0, "falling": 0, "frequency_hz": 0.0,
+        }
         result = await tool_verify_connection(
             hardware=mock_hw, pins={"tx": 4, "rx": 5}, sample_duration_ms=100,
         )
         assert result["activity_detected"] is False
+        assert result["transitions"] == 0
 
     @pytest.mark.asyncio
-    async def test_handles_none_voltages(self):
+    async def test_caps_sample_duration_at_5000(self):
         mock_hw = MagicMock()
-        mock_hw.get_pin_voltages.return_value = None
+        mock_hw.measure_pin.return_value = {
+            "rising": 0, "falling": 0, "frequency_hz": 0.0,
+        }
         result = await tool_verify_connection(
-            hardware=mock_hw, pins={"tx": 4, "rx": 5}, sample_duration_ms=100,
+            hardware=mock_hw, pins={"tx": 4, "rx": 5}, sample_duration_ms=99999,
         )
-        assert result["activity_detected"] is False
-        assert result["samples_taken"] == 0
+        assert result["sample_duration_ms"] == 5000
+        for call in mock_hw.measure_pin.call_args_list:
+            assert call.args[1] == 5000
 
     @pytest.mark.asyncio
-    async def test_configures_uart_before_sampling(self):
+    async def test_measures_both_pins(self):
         mock_hw = MagicMock()
-        mock_hw.get_pin_voltages.return_value = [0, 0, 0, 0, 0, 0, 0, 0]
+        mock_hw.measure_pin.return_value = {
+            "rising": 1, "falling": 1, "frequency_hz": 1.0,
+        }
         await tool_verify_connection(
             hardware=mock_hw, pins={"tx": 4, "rx": 5}, sample_duration_ms=100,
         )
-        mock_hw.configure_uart.assert_called_once_with(speed=115200)
+        assert [c.args[0] for c in mock_hw.measure_pin.call_args_list] == [4, 5]
 
 
 class TestScanBaud:
@@ -304,6 +311,16 @@ class TestSetVoltage:
         assert result["error"] is not None
         mock_hw.set_voltage.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_psu_unavailable(self):
+        mock_hw = MagicMock()
+        mock_hw.set_voltage.side_effect = PSUUnavailableError("no PSU")
+        result = await tool_set_voltage(
+            hardware=mock_hw, voltage_v=3.3, current_limit_ma=300,
+        )
+        assert result["applied"] is False
+        assert result["psu"] == "unavailable"
+
 
 class TestSetPower:
     @pytest.mark.asyncio
@@ -320,6 +337,14 @@ class TestSetPower:
         result = await tool_set_power(hardware=mock_hw, enable=False)
         assert result["applied"] is True
         assert result["power"] == "off"
+
+    @pytest.mark.asyncio
+    async def test_psu_unavailable(self):
+        mock_hw = MagicMock()
+        mock_hw.set_power.side_effect = PSUUnavailableError("no PSU")
+        result = await tool_set_power(hardware=mock_hw, enable=True)
+        assert result["applied"] is False
+        assert result["psu"] == "unavailable"
 
 
 class TestEnterDownloadMode:
@@ -1549,30 +1574,3 @@ class TestCloseI2C:
         mock_hw.reset_mode.assert_called_once()
 
 
-class TestValidateLaCommand:
-    def test_valid_simple(self):
-        assert _validate_la_command("[0x9f r:3]") is None
-
-    def test_valid_multi_transaction(self):
-        assert _validate_la_command("[0x9f r:3][0x05 r]") is None
-
-    def test_empty(self):
-        assert "empty" in _validate_la_command("")
-
-    def test_whitespace_only(self):
-        assert "empty" in _validate_la_command("   ")
-
-    def test_too_long(self):
-        assert "too long" in _validate_la_command("[" + "a" * 600 + "]")
-
-    def test_newline_rejected(self):
-        assert "control" in _validate_la_command("[0x9f]\n[0x05]")
-
-    def test_non_ascii_rejected(self):
-        assert "control" in _validate_la_command("[0x9f é r:3]")
-
-    def test_unbalanced_brackets(self):
-        assert "unbalanced" in _validate_la_command("[0x9f r:3")
-
-    def test_no_brackets(self):
-        assert "missing bus transaction brackets" in _validate_la_command("0x9f r:3")

@@ -15,9 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from buspirate_mcp.hardware import BusPirateHardware
-from buspirate_mcp.la import FALASession
-from buspirate_mcp import la_parsers
+from buspirate_mcp.bitpirate_hardware import BitPirateHardware, PSUUnavailableError
 from buspirate_mcp.safety import validate_voltage_range
 from buspirate_mcp.session import SessionManager
 
@@ -81,7 +79,7 @@ def _ascii_score(data: bytes) -> float:
 
 async def tool_list_devices() -> dict[str, Any]:
     """List BusPirate devices on USB."""
-    devices = BusPirateHardware.list_devices()
+    devices = BitPirateHardware.list_devices()
     result: dict[str, Any] = {"devices": devices}
     if not devices:
         result["hint"] = (
@@ -96,57 +94,46 @@ async def tool_verify_connection(
     pins: dict[str, int],
     sample_duration_ms: int = 2000,
 ) -> dict[str, Any]:
-    """Check for signal activity on the specified pins."""
+    """Check for signal activity on the specified pins.
+
+    Uses the firmware's DIO measure (edge counter + approximate frequency)
+    as the activity detector -- this board has no per-pin ADC voltage read.
+    """
     tx_pin = pins["tx"]
+    rx_pin = pins["rx"]
+    hardware._validate_pin(tx_pin)
+    hardware._validate_pin(rx_pin)
+    dur = min(int(sample_duration_ms), 5000)  # firmware caps measure at 5 s
 
-    # Ensure UART mode is active before reading pins
-    hardware.configure_uart(speed=115200)
+    tx = hardware.measure_pin(tx_pin, dur)
+    rx = hardware.measure_pin(rx_pin, dur)
 
-    samples = []
-    transitions = 0
-    start = time.monotonic()
-    end_time = start + (sample_duration_ms / 1000.0)
-
-    while time.monotonic() < end_time:
-        voltages = hardware.get_pin_voltages()
-        if voltages is None:
-            await asyncio.sleep(0.05)
-            continue
-        samples.append(voltages[tx_pin])
-        if len(samples) >= 2 and samples[-1] != samples[-2]:
-            transitions += 1
-        await asyncio.sleep(0.05)
-
-    if not samples:
-        return {
-            "activity_detected": False,
-            "transitions": 0,
-            "approx_frequency_hz": 0.0,
-            "samples_taken": 0,
-            "voltage_range_mv": [0, 0],
-            "message": (
-                f"Could not read pin voltages on pin {tx_pin}. "
-                f"UART mode may not be active or hardware not responding."
-            ),
-        }
-
+    transitions = tx["rising"] + tx["falling"] + rx["rising"] + rx["falling"]
+    freq_hz = max(tx["frequency_hz"], rx["frequency_hz"])
     activity = transitions > 0
-    duration_s = time.monotonic() - start
-    freq_hz = round(transitions / duration_s, 1) if activity else 0.0
+
+    if activity:
+        message = (
+            f"Activity on TX: {tx['rising'] + tx['falling']} edges "
+            f"({tx['frequency_hz']:.2f} Hz); RX: {rx['rising'] + rx['falling']} edges "
+            f"({rx['frequency_hz']:.2f} Hz) over {dur} ms."
+        )
+    else:
+        message = (
+            f"No edges detected on TX ({tx_pin}) or RX ({rx_pin}) in {dur} ms. "
+            "Check wiring, or the target may be idle."
+        )
 
     return {
         "activity_detected": activity,
         "transitions": transitions,
-        "approx_frequency_hz": freq_hz,
-        "samples_taken": len(samples),
-        "voltage_range_mv": [min(samples), max(samples)],
-        "message": (
-            f"Signal transitions detected on pin {tx_pin} "
-            f"({transitions} transitions, ~{freq_hz} Hz)."
-            if activity
-            else f"No activity on pin {tx_pin}. Target may be "
-            f"quiescent, powered off, or wiring incorrect."
-        ),
+        "approx_frequency_hz": round(freq_hz, 2),
+        "pins": {
+            "tx": {"pin": tx_pin, **tx},
+            "rx": {"pin": rx_pin, **rx},
+        },
+        "sample_duration_ms": dur,
+        "message": message,
     }
 
 
@@ -298,7 +285,10 @@ async def tool_set_voltage(
     except ValueError as e:
         return {"applied": False, "error": str(e)}
 
-    result = hardware.set_voltage(voltage_v, current_limit_ma)
+    try:
+        result = hardware.set_voltage(voltage_v, current_limit_ma)
+    except PSUUnavailableError as e:
+        return {"applied": False, "psu": "unavailable", "error": str(e)}
     return {
         "applied": result,
         "voltage_v": voltage_v,
@@ -312,7 +302,10 @@ async def tool_set_power(
     enable: bool,
 ) -> dict[str, Any]:
     """Enable or disable power supply."""
-    result = hardware.set_power(enable)
+    try:
+        result = hardware.set_power(enable)
+    except PSUUnavailableError as e:
+        return {"applied": False, "psu": "unavailable", "error": str(e)}
     return {
         "applied": result,
         "power": "on" if enable else "off",
@@ -361,7 +354,7 @@ async def tool_enter_download_mode(
 
 
 def _enter_bridge_mode(terminal_port: str) -> bool:
-    """Enter UART bridge mode on the BP6 terminal port.
+    """Enter UART bridge mode on the Bit-Pirate console port.
 
     The bridge command makes ACM0 a transparent serial passthrough
     to the target. Handles VT100 prompt, detects current mode, and
@@ -416,11 +409,11 @@ def _enter_bridge_mode(terminal_port: str) -> bool:
 
 
 def _exit_bridge_mode(terminal_port: str) -> None:
-    """Attempt to exit UART bridge mode on the BP6.
+    """Attempt to exit UART bridge mode on the Bit-Pirate.
 
-    Bridge mode exits when the BP6 button is pressed, or when the
+    Bridge mode exits when the Bit-Pirate button is pressed, or when the
     serial port is closed with a break condition. We send a serial
-    break and toggle DTR/RTS to signal the BP6 to drop bridge mode.
+    break and toggle DTR/RTS to signal the Bit-Pirate to drop bridge mode.
     """
     import serial
     try:
@@ -447,17 +440,17 @@ async def tool_read_flash(
     reset_pin: int = -1,
     baud: int = 115200,
 ) -> dict[str, Any]:
-    """Read flash memory from target via esptool through BP6 UART bridge.
+    """Read flash memory from target via esptool through the Bit-Pirate UART bridge.
 
     Optionally enters download mode first if boot_pin and reset_pin are
     provided. Then enters bridge mode on the terminal port and runs
     esptool read-flash.
     """
     # Validate pin numbers when they are being used
-    if boot_pin >= 0 and (not isinstance(boot_pin, int) or boot_pin > 7):
-        return {"error": f"boot_pin must be 0-7, got: {boot_pin}"}
-    if reset_pin >= 0 and (not isinstance(reset_pin, int) or reset_pin > 7):
-        return {"error": f"reset_pin must be 0-7, got: {reset_pin}"}
+    if boot_pin >= 0 and (not isinstance(boot_pin, int) or boot_pin > 48):
+        return {"error": f"boot_pin must be 0-48, got: {boot_pin}"}
+    if reset_pin >= 0 and (not isinstance(reset_pin, int) or reset_pin > 48):
+        return {"error": f"reset_pin must be 0-48, got: {reset_pin}"}
 
     # Step 1: Enter download mode if pins provided
     if boot_pin >= 0 and reset_pin >= 0:
@@ -516,8 +509,8 @@ async def tool_read_flash(
 
     # Step 4: Attempt cleanup.
     # Bridge mode on ACM0 cannot be exited programmatically (only via
-    # the BP6 physical button). BPIO2 commands hang while bridge is
-    # active. The user must USB-replug the BP6 after flash operations
+    # the Bit-Pirate physical button). Protocol commands hang while bridge is
+    # active. The user must USB-replug the Bit-Pirate after flash operations
     # to restore normal operation.
     # TODO: find a way to exit bridge mode without physical button
 
@@ -530,7 +523,7 @@ async def tool_read_flash(
         "baud": baud,
         "stdout": result.stdout[-300:],
         "cleanup": (
-            "Bridge mode is still active. Press the BP6 button or "
+            "Bridge mode is still active. Press the Bit-Pirate button or "
             "USB-replug to exit bridge mode and restore normal operation."
         ),
     }
@@ -1280,235 +1273,5 @@ async def tool_close_spi(
 
 
 # ---------------------------------------------------------------------------
-# FALA (Follow Along Logic Analyzer) tools
+# (Logic analyzer tools removed -- no FALA on this board; use DIO measure)
 # ---------------------------------------------------------------------------
-
-
-async def tool_la_prepare(
-    session_manager: SessionManager,
-    hardware: BusPirateHardware,
-    engagement_name: str,
-    protocol: str,
-    protocol_config: dict | None = None,
-    engagement_path: str | None = None,
-) -> dict[str, Any]:
-    """Switch to FALA mode and enter a bus protocol for capture."""
-    try:
-        # Check no BPIO2 mode is active
-        if hardware._active_mode is not None:
-            return {"error": f"Close the active {hardware._active_mode} session before starting LA"}
-
-        terminal_port = hardware.find_terminal_port()
-        if terminal_port is None:
-            return {"error": "Terminal port not found"}
-
-        # Find the binary/FALA port (the other port)
-        devices = hardware.list_devices()
-        fala_port = None
-        for d in devices:
-            if d["path"] != terminal_port:
-                fala_port = d["path"]
-                break
-        if fala_port is None:
-            return {"error": "FALA port not found"}
-
-        fala = FALASession(terminal_port, fala_port)
-        result = fala.activate(protocol, protocol_config)
-
-        session = session_manager.create(
-            name=engagement_name,
-            hardware=fala,
-            protocol="la",
-            protocol_config={"bus_protocol": protocol, **result},
-            engagement_path=engagement_path,
-        )
-
-        return {
-            "session_id": session.session_id,
-            "engagement_path": str(session.engagement_path),
-            "protocol": protocol,
-            "sample_rate_hz": result.get("sample_rate_hz", 0),
-        }
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-_LA_COMMAND_RE = re.compile(r"^[\x20-\x7E]+$")
-
-
-def _validate_la_command(command: str) -> str | None:
-    """Validate a BP6 bus command before sending to the terminal.
-
-    BP6 bus commands use square brackets for transactions (e.g. `[0x9F r:3]`).
-    Return an error string if invalid, None if OK.
-    """
-    if not command or not command.strip():
-        return "la_command: empty command"
-    if len(command) > 512:
-        return f"la_command: command too long ({len(command)} > 512)"
-    if not _LA_COMMAND_RE.fullmatch(command):
-        return "la_command: command contains control or non-ASCII characters"
-    opens = command.count("[")
-    closes = command.count("]")
-    if opens != closes:
-        return f"la_command: unbalanced brackets ({opens} '[' vs {closes} ']')"
-    if opens == 0:
-        return "la_command: missing bus transaction brackets '[...]'"
-    return None
-
-
-async def tool_la_command(
-    session_manager: SessionManager,
-    session_id: str,
-    command: str,
-) -> dict[str, Any]:
-    """Execute a bus command and capture FALA data."""
-    err = _validate_la_command(command)
-    if err is not None:
-        return {"error": err}
-    try:
-        session = session_manager.get(session_id)
-        fala = session.hardware  # FALASession stored here
-
-        result = fala.execute(command)
-
-        # Save raw capture to artifacts if we got samples
-        capture_info = result.get("capture", {})
-        raw = capture_info.get("raw", b'')
-        raw_file = None
-        if raw:
-            artifacts_dir = session.engagement_path / "artifacts"
-            artifacts_dir.mkdir(parents=True, exist_ok=True)
-            # Find next capture number
-            existing = list(artifacts_dir.glob("capture_*.bin"))
-            num = len(existing) + 1
-            capture_path = artifacts_dir / f"capture_{num:03d}.bin"
-            capture_path.write_bytes(raw)
-            raw_file = str(capture_path.relative_to(session.engagement_path))
-
-        # Log the transaction
-        notification = capture_info.get("notification", {})
-        session.log_transaction(
-            operation="la_command",
-            write_hex=command,
-            read_hex="",
-            metadata={
-                "terminal_output": result.get("terminal_output", ""),
-                "samples": notification.get("samples", 0) if notification else 0,
-                "sample_rate_hz": notification.get("sample_rate_hz", 0) if notification else 0,
-                "raw_file": raw_file,
-            },
-        )
-
-        return {
-            "terminal_output": result.get("terminal_output", ""),
-            "capture": {
-                "samples": notification.get("samples", 0) if notification else 0,
-                "sample_rate_hz": notification.get("sample_rate_hz", 0) if notification else 0,
-                "duration_us": round(notification["samples"] / notification["sample_rate_hz"] * 1_000_000, 2) if notification and notification.get("sample_rate_hz", 0) > 0 else 0,
-                "raw_file": raw_file,
-                "raw_bytes": len(raw),
-            },
-        }
-    except KeyError:
-        return {"error": f"Session not found: {session_id}"}
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-async def tool_la_analyze(
-    session_manager: SessionManager,
-    session_id: str,
-    capture_file: str | None = None,
-    channels: list[int] | None = None,
-) -> dict[str, Any]:
-    """Analyze a FALA capture for signal characteristics."""
-    try:
-        session = session_manager.get(session_id)
-        artifacts_dir = session.engagement_path / "artifacts"
-
-        # Find capture file
-        if capture_file:
-            path = Path(capture_file).resolve() if Path(capture_file).is_absolute() else (session.engagement_path / capture_file).resolve()
-            if not path.is_relative_to(session.engagement_path.resolve()):
-                return {"error": f"Path must be under engagement directory: {capture_file}"}
-        else:
-            # Use latest capture
-            captures = sorted(artifacts_dir.glob("capture_*.bin"))
-            if not captures:
-                return {"error": "No capture files found"}
-            path = captures[-1]
-
-        raw = path.read_bytes()
-        if not raw:
-            return {"error": "Capture file is empty"}
-
-        # Get sample rate from session config or default
-        config = session.protocol if hasattr(session, 'protocol') else None
-        sample_rate = 75_000_000  # default
-
-        result = la_parsers.analyze_channels(raw, sample_rate, channels)
-        result["capture_file"] = str(path.relative_to(session.engagement_path))
-        return result
-    except KeyError:
-        return {"error": f"Session not found: {session_id}"}
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-async def tool_la_identify(
-    session_manager: SessionManager,
-    session_id: str,
-    capture_file: str | None = None,
-) -> dict[str, Any]:
-    """Auto-identify protocols from a FALA capture."""
-    try:
-        session = session_manager.get(session_id)
-        artifacts_dir = session.engagement_path / "artifacts"
-
-        if capture_file:
-            path = Path(capture_file).resolve() if Path(capture_file).is_absolute() else (session.engagement_path / capture_file).resolve()
-            if not path.is_relative_to(session.engagement_path.resolve()):
-                return {"error": f"Path must be under engagement directory: {capture_file}"}
-        else:
-            captures = sorted(artifacts_dir.glob("capture_*.bin"))
-            if not captures:
-                return {"error": "No capture files found"}
-            path = captures[-1]
-
-        raw = path.read_bytes()
-        if not raw:
-            return {"error": "Capture file is empty"}
-
-        sample_rate = 75_000_000
-        analysis = la_parsers.analyze_channels(raw, sample_rate)
-        candidates = la_parsers.identify_protocol(analysis)
-
-        return {
-            "candidates": candidates,
-            "count": len(candidates),
-            "capture_file": str(path.relative_to(session.engagement_path)),
-        }
-    except KeyError:
-        return {"error": f"Session not found: {session_id}"}
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-async def tool_la_cleanup(
-    session_manager: SessionManager,
-    session_id: str,
-) -> dict[str, Any]:
-    """Deactivate FALA and restore BPIO2 mode."""
-    try:
-        session = session_manager.get(session_id)
-        fala = session.hardware
-
-        fala.deactivate()
-        session_manager.close(session_id)
-
-        return {"restored": True, "session_id": session_id}
-    except KeyError:
-        return {"error": f"Session not found: {session_id}"}
-    except Exception as exc:
-        return {"error": str(exc)}

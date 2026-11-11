@@ -1,3 +1,0 @@
-[submodule "vendor/bpio2"]
-	path = vendor/bpio2
-	url = https://github.com/DangerousPrototypes/BusPirate-BPIO2-flatbuffer-interface.git

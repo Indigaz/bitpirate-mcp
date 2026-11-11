@@ -15,7 +15,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from buspirate_mcp.hardware import BusPirateHardware
+from buspirate_mcp.bitpirate_hardware import BitPirateHardware
 from buspirate_mcp.safety import classify_tool, SafetyTier
 from buspirate_mcp.session import SessionManager
 from buspirate_mcp import tools
@@ -30,28 +30,26 @@ ENGAGEMENTS_DIR = Path(
     os.environ.get("PIDEV_ENGAGEMENTS_DIR", str(_PACKAGE_ROOT / "engagements"))
 )
 
-app = Server("buspirate-mcp")
+app = Server("bitpirate-mcp")
 session_manager = SessionManager(engagements_dir=ENGAGEMENTS_DIR)
 
 # Hardware connection -- initialized lazily on first tool call that needs it
-_hardware: BusPirateHardware | None = None
+_hardware: BitPirateHardware | None = None
 _hardware_port: str = ""
 
 
-def _get_hardware(port: str | None = None) -> BusPirateHardware:
+def _get_hardware(port: str | None = None) -> BitPirateHardware:
     global _hardware, _hardware_port
-    # Detect dead connection (uart set to None by disconnect or stale state)
-    if _hardware is not None and _hardware.uart is None:
+    # Detect dead connection (serial set to None by disconnect or stale state)
+    if _hardware is not None and _hardware.serial is None:
         _hardware = None
     if _hardware is None:
         if port is None:
-            devices = BusPirateHardware.list_devices()
+            devices = BitPirateHardware.list_devices()
             if not devices:
-                raise RuntimeError("No BusPirate found on USB")
-            # Find the binary protocol port; fall back to first device
-            binary = [d for d in devices if d["role"] == "binary"]
-            port = binary[0]["path"] if binary else devices[0]["path"]
-        _hardware = BusPirateHardware.connect(port)
+                raise RuntimeError("No ESP32-Bit-Pirate console port found on USB")
+            port = devices[0]["path"]
+        _hardware = BitPirateHardware.connect(port)
         _hardware_port = port
     return _hardware
 
@@ -65,7 +63,7 @@ def _get_hardware(port: str | None = None) -> BusPirateHardware:
 TOOL_DEFINITIONS = [
     Tool(
         name="list_devices",
-        description="Find BusPirate devices on USB CDC serial ports. [read-only] [Duration: instant.]",
+        description="Find ESP32-Bit-Pirate console ports on USB CDC serial. [read-only] [Duration: instant.]",
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),
     Tool(
@@ -78,8 +76,8 @@ TOOL_DEFINITIONS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "tx_pin": {"type": "integer", "description": "BP IO pin number for TX (e.g., 4)"},
-                "rx_pin": {"type": "integer", "description": "BP IO pin number for RX (e.g., 5)"},
+                "tx_pin": {"type": "integer", "description": "ESP32 GPIO for TX (e.g., 4)"},
+                "rx_pin": {"type": "integer", "description": "ESP32 GPIO for RX (e.g., 5)"},
                 "sample_duration_ms": {
                     "type": "integer", "default": 2000,
                     "description": "How long to sample for activity (ms)",
@@ -113,8 +111,8 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "baud": {"type": "integer", "description": "Baud rate"},
-                "tx_pin": {"type": "integer", "description": "BP IO pin number for TX (e.g., 4)", "default": 4},
-                "rx_pin": {"type": "integer", "description": "BP IO pin number for RX (e.g., 5)", "default": 5},
+                "tx_pin": {"type": "integer", "description": "ESP32 GPIO for TX (e.g., 4)", "default": 4},
+                "rx_pin": {"type": "integer", "description": "ESP32 GPIO for RX (e.g., 5)", "default": 5},
                 "engagement_name": {"type": "string", "description": "Target device name"},
                 "engagement_path": {
                     "type": "string",
@@ -217,11 +215,11 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "boot_pin": {
                     "type": "integer",
-                    "description": "BP IO pin connected to target boot select (e.g., GPIO0 on ESP32)",
+                    "description": "ESP32 GPIO connected to target boot select (e.g., target GPIO0)",
                 },
                 "reset_pin": {
                     "type": "integer",
-                    "description": "BP IO pin connected to target EN/RST",
+                    "description": "ESP32 GPIO connected to target EN/RST",
                 },
             },
             "required": ["boot_pin", "reset_pin"],
@@ -230,11 +228,11 @@ TOOL_DEFINITIONS = [
     Tool(
         name="read_flash",
         description=(
-            "Read flash memory from target via esptool through BP6 UART bridge. "
+            "Read flash memory from target via esptool through the Bit-Pirate UART bridge. "
             "Optionally enters download mode first. Requires esptool installed. "
             "[allowed-write] [Duration: very-slow (~3-5 min for 1-2 MiB at 460800 baud; "
             "larger images proportionally longer). Background-dispatch required. "
-            "Bridge mode persists after dump -- press BP6 button or USB-replug to exit.]"
+            "Bridge mode persists after dump -- press the Bit-Pirate button or USB-replug to exit.]"
         ),
         inputSchema={
             "type": "object",
@@ -253,11 +251,11 @@ TOOL_DEFINITIONS = [
                 },
                 "boot_pin": {
                     "type": "integer", "default": -1,
-                    "description": "BP IO pin for boot select (-1 to skip download mode entry)",
+                    "description": "ESP32 GPIO for boot select (-1 to skip download mode entry)",
                 },
                 "reset_pin": {
                     "type": "integer", "default": -1,
-                    "description": "BP IO pin for reset (-1 to skip download mode entry)",
+                    "description": "ESP32 GPIO for reset (-1 to skip download mode entry)",
                 },
                 "baud": {
                     "type": "integer", "default": 115200,
@@ -272,7 +270,7 @@ TOOL_DEFINITIONS = [
         name="open_spi",
         description=(
             "Open an SPI connection and start an engagement. "
-            "Configures SPI mode on the BusPirate, creates engagement folder. "
+            "Configures SPI mode on the ESP32-Bit-Pirate, creates engagement folder. "
             "[allowed-write] [Duration: fast (~0.5-2 s -- mode switch + folder creation).]"
         ),
         inputSchema={
@@ -384,7 +382,7 @@ TOOL_DEFINITIONS = [
     ),
     Tool(
         name="close_spi",
-        description="Close an SPI session and reset the BusPirate to HiZ mode. [allowed-write] [Duration: instant.]",
+        description="Close an SPI session and reset the ESP32-Bit-Pirate to HiZ mode. [allowed-write] [Duration: instant.]",
         inputSchema={
             "type": "object",
             "properties": {
@@ -509,7 +507,7 @@ TOOL_DEFINITIONS = [
     ),
     Tool(
         name="close_i2c",
-        description="Close an I2C session and reset the BusPirate to HiZ mode. [allowed-write] [Duration: instant.]",
+        description="Close an I2C session and reset the ESP32-Bit-Pirate to HiZ mode. [allowed-write] [Duration: instant.]",
         inputSchema={
             "type": "object",
             "properties": {
@@ -574,123 +572,7 @@ TOOL_DEFINITIONS = [
     ),
     Tool(
         name="close_1wire",
-        description="Close a 1-Wire session and reset the BusPirate to HiZ mode. [allowed-write] [Duration: instant.]",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-            },
-            "required": ["session_id"],
-        },
-    ),
-    # --- Logic Analyzer (FALA) tools ---
-    Tool(
-        name="la_prepare",
-        description=(
-            "Switch to FALA (Follow Along Logic Analyzer) mode and enter a bus "
-            "protocol for signal capture. Disconnects BPIO2. Captures all 8 IO pins "
-            "at up to 75 MHz every time a bus command runs. "
-            "[allowed-write] [Duration: fast (~1-3 s -- binmode switch + terminal config). "
-            "Lifecycle: persistent -- BPIO2 is disconnected until la_cleanup.]"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "engagement_name": {
-                    "type": "string",
-                    "description": "Name for the LA engagement",
-                },
-                "protocol": {
-                    "type": "string",
-                    "enum": ["spi", "i2c", "uart", "1wire"],
-                    "description": "Bus protocol to use for terminal commands",
-                },
-                "protocol_config": {
-                    "type": "object",
-                    "description": "Protocol-specific configuration (speed, mode, etc.)",
-                },
-                "engagement_path": {
-                    "type": "string",
-                    "description": "Path to an engagement folder (from project-mcp)",
-                },
-            },
-            "required": ["engagement_name", "protocol"],
-        },
-    ),
-    Tool(
-        name="la_command",
-        description=(
-            "Execute a bus command on the terminal and capture FALA data. "
-            "Uses BP6 terminal syntax: SPI [0x9f r:3], I2C [0xa0 0x00 r:16], etc. "
-            "Returns both decoded terminal output and raw signal capture. "
-            "[read-only] [Duration: slow (~10+ s -- waits for FALA capture notification "
-            "after the bus command completes). Background-dispatch recommended.]"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {
-                    "type": "string",
-                    "description": "Session ID from la_prepare",
-                },
-                "command": {
-                    "type": "string",
-                    "description": "Bus command in BP6 terminal syntax",
-                },
-            },
-            "required": ["session_id", "command"],
-        },
-    ),
-    Tool(
-        name="la_analyze",
-        description=(
-            "Analyze a FALA capture for signal characteristics: transitions, frequency, "
-            "duty cycle, idle state, and role identification per channel. "
-            "[read-only] [Duration: fast (~1-5 s -- in-process signal analysis).]"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "capture_file": {
-                    "type": "string",
-                    "description": "Capture file path relative to engagement (default: latest)",
-                },
-                "channels": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "Channel numbers to analyze (default: all 8)",
-                },
-            },
-            "required": ["session_id"],
-        },
-    ),
-    Tool(
-        name="la_identify",
-        description=(
-            "Auto-identify bus protocols from a FALA capture using signal heuristics. "
-            "Returns ranked candidates with confidence scores and channel mappings. "
-            "[read-only] [Duration: fast (~1-5 s -- in-process heuristic analysis).]"
-        ),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "capture_file": {
-                    "type": "string",
-                    "description": "Capture file path (default: latest)",
-                },
-            },
-            "required": ["session_id"],
-        },
-    ),
-    Tool(
-        name="la_cleanup",
-        description=(
-            "Deactivate FALA and restore BPIO2 mode. After this call, BPIO2 tools "
-            "(SPI, I2C, UART, 1-Wire) are available again. "
-            "[allowed-write] [Duration: fast (~1-3 s -- binmode switch back to BPIO2).]"
-        ),
+        description="Close a 1-Wire session and reset the ESP32-Bit-Pirate to HiZ mode. [allowed-write] [Duration: instant.]",
         inputSchema={
             "type": "object",
             "properties": {
@@ -709,7 +591,7 @@ async def list_tools():
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    if name in {"open_uart", "open_spi", "open_i2c", "open_1wire", "la_prepare"} and "project_path" in arguments:
+    if name in {"open_uart", "open_spi", "open_i2c", "open_1wire"} and "project_path" in arguments:
         return [TextContent(type="text", text=json.dumps(
             {"error": "project_path was renamed to engagement_path in v0.3; "
                       "pass engagement_path instead.", "tool": name}, indent=2))]
@@ -815,9 +697,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "read_flash":
             hw = _get_hardware()
-            terminal_port = BusPirateHardware.find_terminal_port()
+            terminal_port = BitPirateHardware.find_terminal_port()
             if not terminal_port:
-                result = {"error": "Cannot find BP6 terminal port for bridge mode"}
+                result = {"error": "Cannot find Bit-Pirate console port for bridge mode"}
             else:
                 result = await tools.tool_read_flash(
                     hardware=hw,
@@ -979,52 +861,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 session_id=arguments["session_id"],
                 hardware=_get_hardware(),
             )
-
-        # --- Logic Analyzer (FALA) ---
-        elif name == "la_prepare":
-            # Pass hardware so tool can check active mode and find ports.
-            # FALA activation switches binmode, releasing ACM1 from BPIO2.
-            hw = _get_hardware()
-            result = await tools.tool_la_prepare(
-                session_manager=session_manager,
-                hardware=hw,
-                engagement_name=arguments["engagement_name"],
-                protocol=arguments["protocol"],
-                protocol_config=arguments.get("protocol_config"),
-                engagement_path=arguments.get("engagement_path"),
-            )
-            # Null hardware so next BPIO2 call re-detects after FALA cleanup
-            _hardware = None
-
-        elif name == "la_command":
-            result = await tools.tool_la_command(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-                command=arguments["command"],
-            )
-
-        elif name == "la_analyze":
-            result = await tools.tool_la_analyze(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-                capture_file=arguments.get("capture_file"),
-                channels=arguments.get("channels"),
-            )
-
-        elif name == "la_identify":
-            result = await tools.tool_la_identify(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-                capture_file=arguments.get("capture_file"),
-            )
-
-        elif name == "la_cleanup":
-            result = await tools.tool_la_cleanup(
-                session_manager=session_manager,
-                session_id=arguments["session_id"],
-            )
-            # Clear hardware so next BPIO2 call re-detects
-            _hardware = None
 
         else:
             result = {"error": f"Unknown tool: {name}"}
