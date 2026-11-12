@@ -295,6 +295,23 @@ def test_spi_instruction_reads_bytes(hw):
     assert h.spi_instruction("[0x9F r:3]") == b"\xEF\x40\x18"
 
 
+def test_spi_instruction_closes_open_flash_shell_first(hw):
+    """Live finding 2026-11-11: an instruction line sent while the flash
+    shell is open is eaten by the menu prompt ('Invalid number'), so
+    _spi must exit the shell before dispatching."""
+    h, fake = hw
+    _seed_spi_mode(h, fake)
+    fake.expect("flash", MENU)
+    fake.expect("10", "Exiting SPI Flash Shell...\r\n" + PROMPT_SPI)
+    fake.expect("[0x05 r:1]", "SPI Read:\n00 \r\n" + PROMPT_SPI)
+    h._flash_enter()
+    assert h._flash_shell_open
+    assert h.spi_instruction("[0x05 r:1]") == b"\x00"
+    assert not h._flash_shell_open
+    sent = [l for l in fake.lines_sent if l]
+    assert sent.index("10") < sent.index("[0x05 r:1]")
+
+
 def test_spi_instruction_write_only_returns_empty(hw):
     h, fake = hw
     _seed_spi_mode(h, fake)
@@ -314,6 +331,20 @@ def test_flash_exit_closes_shell(hw):
     assert h._flash_shell_open is True
     h._flash_exit()
     assert h._flash_shell_open is False
+
+
+def test_wake_escapes_stuck_flash_shell(hw):
+    """Live finding 2026-11-11: a crashed session left the firmware inside
+    the flash shell menu; wake must exit it or all later line commands
+    (mode/config/instructions) are eaten by the menu prompt."""
+    h, fake = hw
+    fake.expect(" ", MENU)
+    fake.expect("10", "Exiting SPI Flash Shell...\r\n" + PROMPT_SPI)
+    t = h._wake()
+    assert b"Exiting SPI Flash Shell" in t
+    assert h._flash_shell_open is False
+    sent = [x.decode("ascii", "replace").rstrip("\r\n") for x in fake.tx]
+    assert sent == [" ", "10"]
 
 
 def test_wait_marker_timeout_raises(hw):

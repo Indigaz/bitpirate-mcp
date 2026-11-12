@@ -132,10 +132,20 @@ class BitPirateHardware:
         return self.serial
 
     def _wake(self) -> bytes:
-        """Un-park 'Press any key to start' if present; drain the banner."""
+        """Un-park 'Press any key to start' if present; drain the banner.
+
+        If the firmware is parked inside the SPI flash shell menu (e.g. a
+        previously crashed session left the shell open), line commands are
+        eaten by the menu prompt, so exit the shell. Note the wake byte
+        itself may run the shell's default action (Probe) first."""
         s = self._require_serial()
         s.write(b" \r")
-        return self._read_quiescent(timeout=WAKE_TIMEOUT, quiet=WAKE_QUIET)
+        t = self._read_quiescent(timeout=WAKE_TIMEOUT, quiet=WAKE_QUIET)
+        if b"=== SPI Flash Shell ===" in t or b"Enter index (default" in t:
+            self._send_line("10")
+            t += self._wait_marker(b"Exiting SPI Flash Shell", 10.0)
+            self._flash_shell_open = False
+        return t
 
     def _read_quiescent(self, timeout: float, quiet: float) -> bytes:
         s = self._require_serial()
@@ -304,6 +314,10 @@ class BitPirateHardware:
         )
 
     def _spi(self, subcmd: str, *args: str) -> bytes:
+        if self._flash_shell_open:
+            # Instruction lines dispatch in SPI mode, NOT inside the shell's
+            # menu loop (the menu would eat the line: "Invalid number").
+            self._flash_exit()
         if self._active_mode != "spi":
             self._set_mode("spi")
         return self._cmd(" ".join([subcmd, *args]))
