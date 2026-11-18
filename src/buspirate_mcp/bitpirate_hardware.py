@@ -80,6 +80,18 @@ I2C_RE_INSTR_READ: re.Pattern = re.compile(rb"I2C Read:\s*\n([0-9A-Fa-f ]+)")
 I2C_MARK_SCAN: re.Pattern = re.compile(rb"Found device at 0x([0-9A-Fa-f]{1,3})")
 OW_MARK_CONFIGURED: bytes = b"OneWire configured."
 OW_MARK_PRESENT: bytes = b"Device present"
+# UART console (Phase 4): 7-prompt config walk + uread/write markers.
+UART_MARK_RX_PROMPT: bytes = b"RX GPIO"
+UART_MARK_TX_PROMPT: bytes = b"TX GPIO"
+UART_MARK_BAUD_PROMPT: bytes = b"Baud rate"
+UART_MARK_DATA_PROMPT: bytes = b"Data bits"
+UART_MARK_PARITY_PROMPT: bytes = b"Parity"
+UART_MARK_STOP_PROMPT: bytes = b"Stop bits"
+UART_MARK_INV_PROMPT: bytes = b"Inverted"
+UART_MARK_CONFIGURED: bytes = b"UART configured."
+UART_MARK_SENT: bytes = b"UART Write: sent"
+# uread output: "UART READ: none" or "UART READ: <contiguous hex>".
+UART_RE_READ: re.Pattern = re.compile(rb"UART READ: (none|(?:[0-9A-Fa-f]{2})+)")
 OW_RE_XFER: re.Pattern = re.compile(rb"1WIRE XFER: ((?:[0-9A-Fa-f]{2} ?)+)")
 
 from pathlib import Path
@@ -107,7 +119,8 @@ class BitPirateHardware:
 
     def __init__(self, port: str = DEFAULT_PORT, baud: int = CONSOLE_BAUD,
                  i2c_sda: int = 5, i2c_scl: int = 6, i2c_speed: int = 100000,
-                 onewire_pin: int = 9) -> None:
+                 onewire_pin: int = 9, uart_rx: int = 44, uart_tx: int = 43,
+                 uart_baud: int = 115200) -> None:
         self.port: str = port
         self.baud: int = baud
         self.serial: serial.Serial | None = None
@@ -120,6 +133,9 @@ class BitPirateHardware:
         self.i2c_scl: int = i2c_scl
         self.i2c_speed: int = i2c_speed
         self.onewire_pin: int = onewire_pin
+        self.uart_rx: int = uart_rx
+        self.uart_tx: int = uart_tx
+        self.uart_baud: int = uart_baud
 
     # -- lifecycle --
 
@@ -594,17 +610,118 @@ class BitPirateHardware:
             "Power the target from the bench supply."
         )
 
-    # -- protocol sessions: phase stubs --
+    # -- UART (Phase 4) --
+
+    def _ensure_uart(self) -> None:
+        """Ensure UART console mode is live; never re-walk an active session.
+
+        Unlike _ensure_i2c (which re-walks on every transfer), a UART
+        reconfigure (UartService::configure -> _serial->end()) flushes the
+        RX buffer, so read() would lose the very bytes it is polling for.
+        The mode-entry walk already left the UART service configured.
+        """
+        if self._active_mode != "uart":
+            self.configure_uart(self.uart_baud)
 
     def configure_uart(self, speed: int = 115200, data_bits: int = 8,
-                       parity: bool = False, stop_bits: int = 1) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 4: UART session")
+                       parity: bool = False, stop_bits: int = 1,
+                       rx_pin: int | None = None, tx_pin: int | None = None) -> None:
+        """Enter (or reconfigure) UART console mode.
+
+        The firmware auto-walks a 7-prompt config walk (RX GPIO, TX GPIO,
+        Baud rate, Data bits, Parity, Stop bits, Inverted) on every mode
+        entry and on every explicit `config`. The rig wiring is 8N1, so
+        other combinations are rejected instead of walked.
+        """
+        if not isinstance(speed, int) or isinstance(speed, bool) or not 100 <= speed <= 921600:
+            raise ValueError(f"speed must be 100-921600 baud, got: {speed}")
+        if data_bits != 8 or parity or stop_bits != 1:
+            raise ValueError("console-backed UART is 8N1 only (rig wiring)")
+        if rx_pin is not None:
+            self._validate_pin(rx_pin)
+            self.uart_rx = rx_pin
+        if tx_pin is not None:
+            self._validate_pin(tx_pin)
+            self.uart_tx = tx_pin
+        self.uart_baud = speed
+        if self._active_mode == "uart":
+            self._send_line("config")
+        else:
+            self._send_line("mode uart")
+        t = self._wait_text(UART_MARK_RX_PROMPT, 6.0)
+        if UART_MARK_RX_PROMPT in t:
+            self._send_line(str(self.uart_rx))
+            t += self._wait_text(UART_MARK_TX_PROMPT, 4.0)
+            self._send_line(str(self.uart_tx))
+            t += self._wait_text(UART_MARK_BAUD_PROMPT, 4.0)
+            self._send_line(str(self.uart_baud))
+            t += self._wait_text(UART_MARK_DATA_PROMPT, 4.0)
+            self._send_line("8")
+            t += self._wait_text(UART_MARK_PARITY_PROMPT, 4.0)
+            self._send_line("N")
+            t += self._wait_text(UART_MARK_STOP_PROMPT, 4.0)
+            self._send_line("1")
+            t += self._wait_text(UART_MARK_INV_PROMPT, 4.0)
+            self._send_line("n")
+            t += self._wait_text(UART_MARK_CONFIGURED, 10.0)
+        else:
+            # Walk skipped (re-entering a mode already configured): resync
+            # on the mode prompt and confirm the mode is live.
+            t += self._read_until_prompt(6.0)
+        if UART_MARK_CONFIGURED not in t and not PROMPT_RE.search(
+            t[-PROMPT_TAIL_CHARS:].decode("utf-8", "replace")
+        ):
+            raise BitPirateCLIError(
+                "UART mode entry not confirmed (no config walk, no prompt)",
+                t.decode("utf-8", "replace"),
+            )
+        self._active_mode = "uart"
 
     def read(self) -> bytes:
-        raise NotImplementedError("bitpirate-mcp Phase 4: UART session")
+        """Drain UART RX bytes received since the previous read().
+
+        Console-backed via the `uread` command (UartController::handleUread):
+        a bounded read (up to 256 bytes within 150 ms) printed as contiguous
+        hex ("UART READ: <hex>" or "UART READ: none"). `uread` deliberately
+        skips ensureConfigured(): a reconfigure (_serial->end()) would
+        flush the RX buffer and drop the very bytes being read.
+        """
+        self._ensure_uart()
+        t = self._cmd("uread 256 150", timeout=5.0)
+        m = UART_RE_READ.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                "Cannot parse uread result", t.decode("utf-8", "replace")
+            )
+        g = m.group(1)
+        if g == b"none":
+            return b""
+        return bytes.fromhex(g.decode("ascii"))
 
     def write(self, data: bytes) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 4: UART session")
+        """Send raw bytes over the UART port via `write hex{...}`.
+
+        The payload is hex-encoded (binary-safe, no text-escape ambiguity).
+        Console lines are capped at MAX_LINE_CHARS, so payloads are sent in
+        ~75-byte chunks; each chunk's handleWrite reconfigures first
+        (flushing stale RX) and confirms "UART Write: sent N bytes".
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise ValueError(f"write() requires bytes, got: {type(data).__name__}")
+        payload = bytes(data)
+        if len(payload) == 0:
+            raise ValueError("write() requires a non-empty payload")
+        self._ensure_uart()
+        # "write hex{" + N*3 + "}" must stay <= MAX_LINE_CHARS.
+        chunk = max(1, (MAX_LINE_CHARS - len("write hex{}")) // 3)
+        for i in range(0, len(payload), chunk):
+            part = payload[i:i + chunk]
+            line = "write hex{" + " ".join(f"{b:02X}" for b in part) + "}"
+            t = self._cmd(line, timeout=10.0)
+            if UART_MARK_SENT not in t:
+                raise BitPirateCLIError(
+                    "UART write did not confirm", t.decode("utf-8", "replace")
+                )
 
     # -- I2C (Phase 3) --
 

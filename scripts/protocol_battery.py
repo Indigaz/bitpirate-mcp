@@ -439,6 +439,21 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
                "DIO sequence executed; B mirror saw reset pin low->high"
                if obs else "B mirror did not log transitions in this sequence", json.dumps(d)[:300])
 
+    # Release B's GPIO mirror NOW (m3 was its last consumer): mirror mode
+    # holds pin 15 — wired to A's UART RX (GPIO 44) — LOW, so A's UART1
+    # RX reads a continuous 0x00 stream and B cannot echo (u1 ended).
+    # The remaining MCP tier (i2c / 1wire / uart) needs B's UART1 TX
+    # restored. Without this, u9/u10 read NULs and 1-Wire times out.
+    pre = blog.snapshot()
+    blog.write("UART")
+    time.sleep(0.4)
+    post = blog.snapshot()
+    fresh = post[len(pre):] if post.startswith(pre) else post
+    released = "MODE=UART (pin15 restored" in fresh
+    bat.record("m3b-release-mirror", T, released,
+               "B pin 15 back to UART1 TX (mirror released)"
+               if released else "no MODE=UART log: " + fresh[-120:], fresh[-300:])
+
     d = await mcp_call("set_voltage", {"voltage_v": 3.3, "current_limit_ma": 100})
     bat.record("m4-psu-safety-gate", T, d.get("confirmation_required") is True,
                "APPROVAL_WRITE gate held without _confirmed", json.dumps(d)[:300])
@@ -540,20 +555,52 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("m17-close-1wire", T, d.get("closed") is True,
                "1-wire session closed", json.dumps(d)[:300])
 
-    # --- Phase 4 (UART session): still stubs — audit as expected. ---
-    stubs = [
-        ("open_uart", {"baud": 115200, "engagement_name": "battery"}),
-        ("scan_baud", {}),
-        ("read_output", {"session_id": "stub"}),
-        ("send_command", {"session_id": "stub", "command": "AT"}),
-    ]
-    for name, args in stubs:
-        d = await mcp_call(name, args)
-        err = str(d.get("error", ""))
-        stubbed = ("error" in d) or (d.get("confirmation_required") is True)
-        bat.record(f"stub-{name}", T, stubbed,
-                   f"stubbed as expected ({err[:60]})" if stubbed else
-                   f"UNEXPECTED result: {json.dumps(d)[:120]}", json.dumps(d)[:300])
+    # --- Phase 4 (implemented 2026-11-18): real UART MCP sessions.
+    # Console-backed driver: `uread` (bounded non-flushing read) +
+    # `write hex{...}`. B is an echo-only responder: PING -> PONG x10
+    # (50 ms apart), any other line -> ECHO:<line> x3.
+    d = await mcp_call("open_uart", {"baud": 115200,
+                                     "pins": {"rx": "44", "tx": "43"},
+                                     "engagement_name": "battery-uart"})
+    uart_sid = d.get("session_id")
+    bat.record("u7-open-uart", T, bool(uart_sid),
+               f"session {uart_sid} (115200 8N1)" if uart_sid
+               else "no session_id: " + str(d.get("error", ""))[:120],
+               json.dumps(d)[:300])
+
+    # B is idle (echo-only): every rate scores ~0; the step exercises the
+    # full scan pipeline (8 reconfigures + reads) and the baud restore.
+    d = await mcp_call("scan_baud", {})
+    n_cand = len(d.get("candidates", []))
+    bat.record("u8-scan-baud", T, n_cand == 8,
+               f"{n_cand} rates scored "
+               f"(recommended={d.get('recommended')}, idle B target)",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("send_command", {"session_id": uart_sid or "stub",
+                                        "command": "PING"})
+    n_pong = str(d.get("response", "")).count("PONG")
+    bat.record("u9-send-ping", T, "PONG" in str(d.get("response", "")),
+               f"PONG x{n_pong} ({d.get('bytes_received')}B)",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("send_command", {"session_id": uart_sid or "stub",
+                                        "command": "HELLO"})
+    n_echo = str(d.get("response", "")).count("ECHO:HELLO")
+    bat.record("u10-send-hello", T, "HELLO" in str(d.get("response", "")),
+               f"ECHO:HELLO x{n_echo} ({d.get('bytes_received')}B)",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("read_output", {"session_id": uart_sid or "stub",
+                                       "timeout_ms": 800})
+    bat.record("u11-read-idle", T,
+               isinstance(d.get("bytes_received"), int),
+               f"idle read: {d.get('bytes_received')} bytes (idle B)",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("close_uart", {"session_id": uart_sid or "stub"})
+    bat.record("u12-close-uart", T, d.get("closed") is True,
+               "uart session closed", json.dumps(d)[:300])
 
 
 def main() -> int:

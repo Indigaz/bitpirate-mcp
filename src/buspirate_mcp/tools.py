@@ -121,6 +121,9 @@ async def tool_scan_baud(
     hardware: Any,
 ) -> dict[str, Any]:
     """Scan common baud rates and score by readable ASCII output."""
+    # The scan leaves the port at the last scanned rate; restore the
+    # pre-scan baud afterwards or the next command runs at the wrong rate.
+    prev_baud = getattr(hardware, "uart_baud", 0)
     candidates = []
 
     for rate in COMMON_BAUD_RATES:
@@ -138,6 +141,9 @@ async def tool_scan_baud(
 
     candidates.sort(key=lambda c: c["score"], reverse=True)
     best = candidates[0] if candidates else {"score": 0.0}
+
+    if prev_baud:
+        hardware.configure_uart(speed=prev_baud)
 
     return {
         "candidates": candidates,
