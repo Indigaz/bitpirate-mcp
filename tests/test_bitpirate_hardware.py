@@ -263,15 +263,11 @@ def test_set_power_raises_psu_unavailable(hw):
 @pytest.mark.parametrize(
     "call",
     [
+        # Phase 4 (UART session) stubs only; the Phase 3 I2C/1-Wire methods
+        # are implemented (see test_bitpirate_phase3.py).
         lambda h: h.configure_uart(speed=115200),
         lambda h: h.read(),
         lambda h: h.write(b"abc"),
-        lambda h: h.configure_i2c(speed=400000),
-        lambda h: h.i2c_transfer(b"\x50", 1),
-        lambda h: h.i2c_scan(),
-        lambda h: h.configure_1wire(),
-        lambda h: h.onewire_reset(),
-        lambda h: h.onewire_transfer(b"\xfc", 0),
     ],
 )
 def test_phase_stubs_raise_not_implemented(hw, call):

@@ -72,6 +72,16 @@ RE_FLASH_CAP = re.compile(rb"Capacity: (\d+) bytes")
 RE_FLASH_MATCH = re.compile(rb"^(0x[0-9A-Fa-f]{1,6}): (.+)$", re.MULTILINE)
 RE_SPI_READ = re.compile(rb"SPI Read:\s*\n([0-9A-Fa-f ]+)")
 
+# -- I2C / 1-Wire (v1.8 source: I2cController.cpp, OneWireController.cpp) --
+I2C_MARK_CONFIGURED: bytes = b"I2C configured."
+# Instruction path prints "I2C Read:\n<hex bytes>" (I2cService::executeByteCode)
+I2C_RE_INSTR_READ: re.Pattern = re.compile(rb"I2C Read:\s*\n([0-9A-Fa-f ]+)")
+# std::hex without setw: "Found device at 0x5" for sub-0x10 addresses
+I2C_MARK_SCAN: re.Pattern = re.compile(rb"Found device at 0x([0-9A-Fa-f]{1,3})")
+OW_MARK_CONFIGURED: bytes = b"OneWire configured."
+OW_MARK_PRESENT: bytes = b"Device present"
+OW_RE_XFER: re.Pattern = re.compile(rb"1WIRE XFER: ((?:[0-9A-Fa-f]{2} ?)+)")
+
 from pathlib import Path
 
 
@@ -95,7 +105,9 @@ class BitPirateHardware:
     layers compile unchanged; Bit-Pirate-specific methods are marked +.
     """
 
-    def __init__(self, port: str = DEFAULT_PORT, baud: int = CONSOLE_BAUD) -> None:
+    def __init__(self, port: str = DEFAULT_PORT, baud: int = CONSOLE_BAUD,
+                 i2c_sda: int = 5, i2c_scl: int = 6, i2c_speed: int = 100000,
+                 onewire_pin: int = 9) -> None:
         self.port: str = port
         self.baud: int = baud
         self.serial: serial.Serial | None = None
@@ -103,6 +115,11 @@ class BitPirateHardware:
         self._flash_shell_open: bool = False
         self._last_voltage_mv: int = 0
         self._last_current_ma: int = 0
+        # Protocol pins/speeds (XIAO env / current rig wiring defaults).
+        self.i2c_sda: int = i2c_sda
+        self.i2c_scl: int = i2c_scl
+        self.i2c_speed: int = i2c_speed
+        self.onewire_pin: int = onewire_pin
 
     # -- lifecycle --
 
@@ -184,6 +201,24 @@ class BitPirateHardware:
                     time.sleep(SETTLE)
                     buf += s.read(4096)
                     break
+        return buf
+
+    def _wait_text(self, marker: bytes, timeout: float = 8.0) -> bytes:
+        """Read console until `marker` appears; return accumulated bytes.
+
+        Same loop shape as _read_until_prompt but keyed on a content marker
+        instead of the mode prompt (for config walks that end at the prompt
+        only after the answers are sent).
+        """
+        s = self._require_serial()
+        buf = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = s.read(4096)
+            if chunk:
+                buf += chunk
+                if marker in buf:
+                    return buf
         return buf
 
     def _cmd(self, text: str, timeout: float = 6.0) -> bytes:
@@ -571,26 +606,165 @@ class BitPirateHardware:
     def write(self, data: bytes) -> None:
         raise NotImplementedError("bitpirate-mcp Phase 4: UART session")
 
+    # -- I2C (Phase 3) --
+
+    def _ensure_i2c(self) -> None:
+        """Enter I2C console mode (with config walk) if not already in it."""
+        if self._active_mode != "i2c":
+            self.configure_i2c(self.i2c_speed)
+
     def configure_i2c(self, speed: int = 400000, clock_stretch: bool = False,
                       voltage_mv: int | None = None,
                       current_ma: int | None = None) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 3: I2C session")
+        """Enter (or reconfigure) I2C console mode.
 
-    def i2c_transfer(self, write_data: bytes, read_bytes: int = 0) -> bytes:
-        raise NotImplementedError("bitpirate-mcp Phase 3: I2C session")
+        voltage_mv/current_ma: no-op (this board has no PSU). clock_stretch:
+        no-op (no console knob). Pins come from the constructor defaults
+        (rig wiring); the firmware auto-walks the SDA/SCL/Frequency prompts
+        on every mode entry (releaseMode -> ensureReleased resets its
+        configured flag) or on an explicit `config`.
+        """
+        if not isinstance(speed, int) or isinstance(speed, bool) or not 1000 <= speed <= 4000000:
+            raise ValueError(f"speed must be 1000-4000000 Hz, got: {speed}")
+        self.i2c_speed = speed
+        if self._active_mode == "i2c":
+            self._send_line("config")
+        else:
+            self._send_line("mode i2c")
+        t = self._wait_text(b"SDA GPIO", 6.0)
+        if b"SDA GPIO" in t:
+            self._send_line(str(self.i2c_sda))
+            t += self._wait_text(b"SCL GPIO", 6.0)
+            self._send_line(str(self.i2c_scl))
+            t += self._wait_text(b"Frequency", 6.0)
+            self._send_line(str(speed))
+            t += self._wait_text(I2C_MARK_CONFIGURED, 10.0)
+        else:
+            # Walk skipped (re-entering a mode already configured): resync
+            # on the mode prompt and confirm the mode is live.
+            t += self._read_until_prompt(6.0)
+        if I2C_MARK_CONFIGURED not in t and not PROMPT_RE.search(
+            t[-PROMPT_TAIL_CHARS:].decode("utf-8", "replace")
+        ):
+            raise BitPirateCLIError(
+                "I2C mode entry not confirmed (no config walk, no prompt)",
+                t.decode("utf-8", "replace"),
+            )
+        self._active_mode = "i2c"
 
-    def i2c_scan(self, start_addr: int = 0x00, end_addr: int = 0x7F) -> list:
-        raise NotImplementedError("bitpirate-mcp Phase 3: I2C session")
+    def i2c_transfer(self, write_data: list[int], read_bytes: int = 0) -> bytes:
+        """One I2C transaction: write bytes, then (optionally) read.
+
+        write_data[0] is the raw 8-bit slave address (tools send
+        (addr_7bit << 1) & 0xFE); the remaining bytes are written as one
+        register-pointer + payload stream. read_bytes > 0 performs a
+        repeated-start burst read of that many bytes.
+
+        Console-backed via the bracket-instruction syntax
+        (I2cController::handleInstruction -> I2cService::executeByteCode):
+        [0x<addr7> <w1> ... <wN> r:<count>] = START, writes, READ count,
+        STOP. One console round-trip per transaction; the read result is
+        printed as "I2C Read:\\n<hex bytes>" (empty on NACK).
+        """
+        if not isinstance(read_bytes, int) or isinstance(read_bytes, bool) or read_bytes < 0:
+            raise ValueError(f"read_bytes must be an int >= 0, got: {read_bytes!r}")
+        if not write_data:
+            raise ValueError("write_data must contain at least the slave address byte")
+        for b in write_data:
+            if not isinstance(b, int) or isinstance(b, bool) or not 0 <= b <= 0xFF:
+                raise ValueError(f"write_data bytes must be ints 0-255, got: {b!r}")
+        if read_bytes == 0 and len(write_data) < 2:
+            return b""  # address only: nothing to write
+        self._ensure_i2c()
+        tokens = [f"0x{write_data[0] >> 1:02X}"]
+        tokens += [f"0x{b:02X}" for b in write_data[1:]]
+        if read_bytes > 0:
+            tokens.append(f"r:{read_bytes}")
+        t = self._cmd("[" + " ".join(tokens) + "]", 8.0)
+        if read_bytes == 0:
+            return b""
+        m = I2C_RE_INSTR_READ.search(t)
+        if not m:
+            return b""  # device NACKed: no result line printed
+        return bytes.fromhex(" ".join(m.group(1).decode().split()))
+
+    def i2c_scan(self, start_addr: int = 0x00, end_addr: int = 0x7F) -> list[int]:
+        """Scan 7-bit addresses; returns RAW 8-bit addresses (<<1 shifted).
+
+        The console `scan` probes every address without needing input
+        (SerialTerminalInput::readChar is non-blocking: empty input
+        continues the sweep), so it runs to completion on its own.
+        """
+        self._ensure_i2c()
+        t = self._cmd("scan", timeout=30.0)
+        found = [int(m, 16) for m in I2C_MARK_SCAN.findall(t)]
+        return sorted(a << 1 for a in found if start_addr <= a <= end_addr)
+
+    # -- 1-Wire (Phase 3) --
+
+    def _ensure_1wire(self) -> None:
+        """Enter 1-Wire console mode (with config walk) if not already in it."""
+        if self._active_mode != "1wire":
+            self.configure_1wire()
 
     def configure_1wire(self, voltage_mv: int | None = None,
                         current_ma: int | None = None) -> None:
-        raise NotImplementedError("bitpirate-mcp Phase 3: 1-Wire session")
+        """Enter (or reconfigure) 1-Wire console mode.
 
-    def onewire_reset(self):
-        raise NotImplementedError("bitpirate-mcp Phase 3: 1-Wire session")
+        voltage_mv/current_ma: no-op (no PSU). The firmware walks the
+        "Data GPIO" prompt only on the FIRST entry after boot (the OneWire
+        controller is not released on mode exit, so its configured flag
+        persists); later entries skip straight to the prompt.
+        """
+        if self._active_mode == "1wire":
+            self._send_line("config")
+        else:
+            self._send_line("mode 1wire")
+        t = self._wait_text(b"Data GPIO", 6.0)
+        if b"Data GPIO" in t:
+            self._send_line(str(self.onewire_pin))
+            t += self._wait_text(OW_MARK_CONFIGURED, 10.0)
+        else:
+            # Walk skipped: resync on the mode prompt.
+            t += self._read_until_prompt(6.0)
+        if OW_MARK_CONFIGURED not in t and not PROMPT_RE.search(
+            t[-PROMPT_TAIL_CHARS:].decode("utf-8", "replace")
+        ):
+            raise BitPirateCLIError(
+                "1-Wire mode entry not confirmed (no config walk, no prompt)",
+                t.decode("utf-8", "replace"),
+            )
+        self._active_mode = "1wire"
 
-    def onewire_transfer(self, write_data: bytes, read_bytes: int = 0) -> bytes:
-        raise NotImplementedError("bitpirate-mcp Phase 3: 1-Wire session")
+    def onewire_reset(self) -> bool:
+        """Reset the 1-Wire bus and report presence (console `ping`)."""
+        self._ensure_1wire()
+        t = self._cmd("ping", 8.0)
+        return OW_MARK_PRESENT in t
+
+    def onewire_transfer(self, write_data: list[int], read_bytes: int = 0) -> bytes:
+        """One 1-Wire transaction: reset, write bytes, read (console `xfer`).
+
+        write_data: command bytes to master-write after the reset (e.g.
+        [0x33] for read-ROM); read_bytes: bytes to read after the writes.
+        """
+        if not isinstance(read_bytes, int) or isinstance(read_bytes, bool) or read_bytes < 0:
+            raise ValueError(f"read_bytes must be an int >= 0, got: {read_bytes!r}")
+        for b in write_data:
+            if not isinstance(b, int) or isinstance(b, bool) or not 0 <= b <= 0xFF:
+                raise ValueError(f"write_data bytes must be ints 0-255, got: {b!r}")
+        self._ensure_1wire()
+        hex_part = " ".join(f"0x{b:02X}" for b in write_data)
+        cmd = f"xfer {read_bytes}" + (f" {hex_part}" if hex_part else "")
+        t = self._cmd(cmd, 15.0)
+        if b"no device" in t or read_bytes == 0:
+            return b""
+        m = OW_RE_XFER.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                "Cannot parse 1-Wire xfer result", t.decode("utf-8", "replace")
+            )
+        return bytes.fromhex(" ".join(m.group(1).decode().split()))
 
     # -- teardown --
 

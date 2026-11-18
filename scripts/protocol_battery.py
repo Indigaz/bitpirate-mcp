@@ -33,14 +33,15 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 import serial
 
 import buspirate_mcp.server as server
 from buspirate_mcp.bitpirate_hardware import BitPirateHardware
 
-A_PORT = "/dev/ttyACM0"
-B_PORT = "/dev/ttyACM1"
+A_PORT = "/dev/ttyACM1"
+B_PORT = "/dev/ttyACM0"
 BAUD = 115200
 
 # Board A pin map (wired links)
@@ -398,18 +399,20 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     bat.record("1wire-scan", T, ok and ROM_EXPECTED[:2] in txt,
                "search found device" if ok else "no device found in search", txt)
 
-    # WRITE SP: KNOWN B-side responder limitation (documented 2026-11-15).
-    # A drives correct bits on the wire (verified by DQ waveform: byte1=0xCC,
-    # byte2=0x0F both clean), but the responder misreads the consecutive
-    # write-sp bytes (reads 0x0F as 0xCF). Reported as KNOWN — visible in the
-    # output but excluded from the pass/total score.
-    ok, txt = con.cmd("write sp 11 22 33 44 55 66 77 52", "OneWire Write:", 20)
-    wsp_ok = ("Failed" not in txt) and ("Mismatch" not in txt)
-    bat.record("1wire-write-sp", T, wsp_ok,
-               "write-sp passed (limitation no longer reproduces)" if wsp_ok
-               else "KNOWN B-side limitation: responder misreads consecutive "
-                    "write-sp bytes (A drives correct bits on the wire)",
-               txt, known=True)
+    # WRITE SP: fixed 2026-11-17 (rig-responder v1.10). Root cause was a
+    # B-side firmware bug: dwDispatch() never cleared the s_cmd accumulator,
+    # so each byte was ORed into the previous byte (0xCC|0x0F=0xCF -> 0xFF).
+    # A-side payload bytes must carry a 0x prefix: A's parseByte() treats
+    # bare numbers as DECIMAL, which would break A's own scratchpad-CRC
+    # self-check (crc8(11 22 33 44 55 66 77)==0x52 only for hex parsing).
+    con.send("write sp 0x11 0x22 0x33 0x44 0x55 0x66 0x77 0x52")
+    ok, txt = con.wait("Scratchpad write successful.", 30)
+    if not ok:
+        ok, fail_txt = con.wait("Failed after", 8)
+        txt = fail_txt
+    bat.record("1wire-write-sp", T, ok,
+               "write-sp passed (v1.10 s_cmd-accumulator fix)" if ok
+               else "write-sp failed: " + txt[-200:], txt)
 
 
 async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
@@ -449,29 +452,107 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("m6-psu-power-absent", T, "error" in d,
                d.get("error", "no error")[:120], json.dumps(d)[:300])
 
+    # --- Phase 3 (implemented 2026-11-17): real I2C + 1-Wire MCP sessions.
+    # Console-backed driver: one bracket-instruction round-trip per transfer.
+    # B's slave answers one byte per I2C request (onI2cRequest), so the
+    # dump exercises the pipeline with size=1.
+    d = await mcp_call("open_i2c", {"speed": 100000,
+                                    "engagement_name": "battery-i2c"})
+    i2c_sid = d.get("session_id")
+    bat.record("m7-open-i2c", T, bool(i2c_sid),
+               f"session {i2c_sid} (100 kHz)" if i2c_sid
+               else "no session_id: " + str(d.get("error", ""))[:120],
+               json.dumps(d)[:300])
+
+    d = await mcp_call("i2c_scan", {"session_id": i2c_sid or "stub"})
+    devs = [x.get("address") for x in d.get("devices", [])]
+    bat.record("m8-i2c-scan", T, "0x50" in devs,
+               f"devices={devs}" if devs else "no devices found",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("i2c_write", {"session_id": i2c_sid or "stub",
+                                     "device_addr": "0x50", "register_addr": 3,
+                                     "data_hex": "A5", "_confirmed": True})
+    bat.record("m9-i2c-write-03-a5", T,
+               d.get("written") is True and d.get("bytes_written") == 1,
+               f"write reg=0x03 A5 ({d.get('bytes_written')}B)"
+               if d.get("written") else d.get("error", "no written flag"),
+               json.dumps(d)[:300])
+
+    d = await mcp_call("i2c_read", {"session_id": i2c_sid or "stub",
+                                    "device_addr": "0x50", "register_addr": 3})
+    bat.record("m10-i2c-read-03-a5", T, d.get("data_hex") == "a5",
+               f"read reg=0x03 -> {d.get('data_hex')}", json.dumps(d)[:300])
+
+    # Dump of size 1. Expected value is 0xA5, not 0x00: the B responder's
+    # I2C slave only applies the pointer byte on WRITE (W+STOP) transfers;
+    # on read (W+Sr+R) transfers the pointer byte is dropped and the stale
+    # pointer is used (observed for both the console read-00-zero and this
+    # dump). After m9 (write reg 3 <- A5) and m10 (read reg 3), the pointer
+    # is 3, so the dump deterministically returns regs[3] = 0xA5. The step
+    # still exercises the full MCP dump pipeline (transfer + artifact file).
+    d = await mcp_call("i2c_dump", {"session_id": i2c_sid or "stub",
+                                    "device_addr": "0x50", "size": 1})
+    dump_file = d.get("file_path", "")
+    dump_ok = (d.get("bytes_read") == 1 and bool(dump_file)
+               and Path(dump_file).exists()
+               and Path(dump_file).read_bytes() == b"\xa5")
+    bat.record("m11-i2c-dump-01", T, dump_ok,
+               f"dump 1B -> preview={d.get('hex_preview', '?')} "
+               f"(stale-pointer read of reg 3 written by m9) "
+               f"file={Path(dump_file).name if dump_file else 'missing'}",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("close_i2c", {"session_id": i2c_sid or "stub"})
+    bat.record("m12-close-i2c", T, d.get("closed") is True,
+               "i2c session closed", json.dumps(d)[:300])
+
+    d = await mcp_call("open_1wire", {"engagement_name": "battery-1wire"})
+    ow_sid = d.get("session_id")
+    bat.record("m13-open-1wire", T, bool(ow_sid),
+               f"session {ow_sid}" if ow_sid
+               else "no session_id: " + str(d.get("error", ""))[:120],
+               json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_search", {"session_id": ow_sid or "stub"})
+    bat.record("m14-1wire-search", T,
+               d.get("present") is True and d.get("crc_valid") is True
+               and d.get("rom_code") == "2811223344556656"
+               and d.get("family_code") == "0x28",
+               f"present={d.get('present')} rom={d.get('rom_code')} "
+               f"crc={d.get('crc_valid')} fam={d.get('family_code')}",
+               json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_read", {"session_id": ow_sid or "stub",
+                                        "write_hex": "33", "read_bytes": 8})
+    bat.record("m15-1wire-read-rom", T, d.get("rx") == "2811223344556656",
+               f"ROM rx={d.get('rx')}", json.dumps(d)[:300])
+
+    # scratchpad content: the console tier's write-sp step above stored
+    # 11 22 33 44 55 66 77 52 verbatim (B keeps all 8 bytes; only the
+    # 9th/0xBE byte is recomputed).
+    d = await mcp_call("onewire_read", {"session_id": ow_sid or "stub",
+                                        "write_hex": "AA", "read_bytes": 8})
+    bat.record("m16-1wire-read-sp", T, d.get("rx") == "1122334455667752",
+               f"SPAD rx={d.get('rx')} (post-write-sp)", json.dumps(d)[:300])
+
+    d = await mcp_call("close_1wire", {"session_id": ow_sid or "stub"})
+    bat.record("m17-close-1wire", T, d.get("closed") is True,
+               "1-wire session closed", json.dumps(d)[:300])
+
+    # --- Phase 4 (UART session): still stubs — audit as expected. ---
     stubs = [
         ("open_uart", {"baud": 115200, "engagement_name": "battery"}),
         ("scan_baud", {}),
         ("read_output", {"session_id": "stub"}),
         ("send_command", {"session_id": "stub", "command": "AT"}),
-        ("open_i2c", {"engagement_name": "battery"}),
-        ("i2c_scan", {"session_id": "stub"}),
-        ("i2c_read", {"session_id": "stub", "device_addr": "0x50"}),
-        ("i2c_write", {"session_id": "stub", "device_addr": "0x50",
-                       "register_addr": "3", "data_hex": "A5"}),
-        ("i2c_dump", {"session_id": "stub", "device_addr": "0x50"}),
-        ("open_1wire", {"engagement_name": "battery"}),
-        ("onewire_search", {"session_id": "stub"}),
-        ("onewire_read", {"session_id": "stub", "write_hex": "33", "read_bytes": 8}),
     ]
     for name, args in stubs:
         d = await mcp_call(name, args)
         err = str(d.get("error", ""))
-        # Stubs raise "bitpirate-mcp Phase N: <proto> session" or "'stub'";
-        # i2c_write hits the safety gate first (confirmation_required).
         stubbed = ("error" in d) or (d.get("confirmation_required") is True)
         bat.record(f"stub-{name}", T, stubbed,
-                   f"stubbed/gated as expected ({err[:60]})" if stubbed else
+                   f"stubbed as expected ({err[:60]})" if stubbed else
                    f"UNEXPECTED result: {json.dumps(d)[:120]}", json.dumps(d)[:300])
 
 
