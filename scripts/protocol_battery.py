@@ -290,11 +290,14 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     bat.record("dio-square-arm", T, "SQUARE 1kHz" in blog.snapshot(),
                "B square wave armed via B console (u1 ended)", "")
 
+    b_before = blog.snapshot()
     ok, txt = con.cmd(f"measure {DIO_READ} 1000", "Rising edges", 6)
     m = re.search(r"Rising edges:\s+(\d+)", txt)
     rising = int(m.group(1)) if m else -1
+    b_during = blog.snapshot()[len(b_before):]
     bat.record("dio-measure-edges", T, ok and rising >= 300,
-               f"rising edges in 1s = {rising} (expect ~500 at 1 kHz)", txt)
+               f"rising edges in 1s = {rising} (expect ~500 at 1 kHz); B logged {len(b_during)} chars in window",
+               txt + "\n[B-console-during-measure] " + b_during[:500])
 
     blog.write("STOP")
     time.sleep(0.3)
@@ -324,7 +327,19 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
                f"set {DIO_DRIVE} L -> read {DIO_READ}" if lo else txt2[-120:], txt2)
 
     ok, txt = con.cmd("mode hiz", "HIZ>", 4)
-    bat.record("back-to-hiz", T, ok, "mirror stays armed for MCP tier", txt)
+    bat.record("back-to-hiz", T, ok, "mirror armed for the dio loopback", txt)
+
+    # Release the mirror before the I2C/1-Wire console tier: mirror mode
+    # holds pin 15 (wired to A's UART RX, pin 44) LOW -> a continuous
+    # 0x00 stream on A's UART1 RX. The mirror is re-armed right before
+    # m3 (its last consumer) via the B console (m3a-arm-mirror).
+    blog.write("UART")
+    time.sleep(0.4)
+    fresh = blog.snapshot()
+    released = "MODE=UART (pin15 restored" in fresh
+    bat.record("dio-mirror-release", T, released,
+               "B pin 15 back to UART1 TX (mirror released)"
+               if released else "no MODE=UART log: " + fresh[-120:], fresh[-300:])
 
     # ---------- I2C tier ----------
     # A's I2C mode entry prints an interactive config prompt (unlike UART/DIO).
@@ -344,7 +359,10 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
                "scan found 0x50" if ok and "0x50" in txt else txt[-150:], txt)
 
     # A's `write` asks an interactive "[y]:" confirmation before executing.
-    con.send("write 0x50 3 A5")
+    # NOTE: data byte needs a 0x prefix — A's console parser takes bare
+    # numerics as DECIMAL, so "A5" is rejected (A prints its help text) and
+    # the write never happens (reg 3 readback 0x00).
+    con.send("write 0x50 3 0xA5")
     ok, txt = con.wait("[y]:", 4)
     con.send("y")
     ok2, txt2 = con.wait("I2C Write:", 4)
@@ -428,6 +446,17 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("m2-verify-connection", T, "activity_detected" in d,
                f"activity={d.get('activity_detected')} transitions={d.get('transitions')}",
                json.dumps(d)[:300])
+
+    # Re-arm B's GPIO mirror via its console (it was released after the
+    # dio tier): m3 observes the reset-pin pulse on the mirror.
+    pre = blog.snapshot()
+    blog.write("GPIO")
+    time.sleep(0.4)
+    fresh = blog.snapshot()
+    armed = "MODE=GPIO" in fresh
+    bat.record("m3a-arm-mirror", T, armed,
+               "B mirror armed (in=10 -> out=15)" if armed
+               else "no MODE=GPIO log: " + fresh[-120:], fresh[-300:])
 
     pre = blog.snapshot()
     d = await mcp_call("enter_download_mode", {"boot_pin": 2, "reset_pin": 4})
