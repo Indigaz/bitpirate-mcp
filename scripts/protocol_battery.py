@@ -260,6 +260,13 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
             con.send(f"set {pin} {lvl}")
             time.sleep(0.25)
             con.drain(0.02)
+    # A's 'hiz' does not actually release DIO pins (upstream quirk:
+    # disableAllProtocols() is empty) — the last audit level on pin 9
+    # would hold B's 1-Wire DQ LOW for the rest of the run and B's DW
+    # state machine would flood the log buffer (runs 4-6). End DQ HIGH.
+    con.send("set 9 H")
+    time.sleep(0.1)
+    con.drain(0.05)
     con.cmd("mode hiz", "HIZ>", 4)
     # wait for the FRESH AUDIT end (the boot liveness probe already logged one)
     audit_txt = blog.wait_new("AUDIT end:", 15.0)
