@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sys
 import threading
@@ -197,6 +198,35 @@ class BLog:
             self.thread.join(timeout=2.0)
         except Exception:
             pass
+
+
+class _TeeSerial:
+    """Diagnostic wrapper: tee a Serial's traffic to a log file (BATTERY_LOG_A)."""
+
+    def __init__(self, inner, logpath: str) -> None:
+        self.inner = inner
+        self.logfile = open(logpath, "ab")
+
+    def write(self, data) -> int:
+        self.logfile.write(b"<< " + data)
+        self.logfile.flush()
+        return self.inner.write(data)
+
+    def read(self, size: int = 1):
+        d = self.inner.read(size)
+        if d:
+            self.logfile.write(b">> " + d)
+            self.logfile.flush()
+        return d
+
+    def close(self) -> None:
+        try:
+            self.inner.close()
+        finally:
+            self.logfile.close()
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
 
 
 async def mcp_call(name: str, args: dict) -> dict:
@@ -685,6 +715,8 @@ def main() -> int:
     con.close()
 
     hw = BitPirateHardware.connect(A_PORT)
+    if os.environ.get("BATTERY_LOG_A"):
+        hw.serial = _TeeSerial(hw.serial, os.environ["BATTERY_LOG_A"])
     server._hardware = hw
     server._hardware_port = A_PORT
     asyncio.run(run_mcp_tier(bat, blog))
