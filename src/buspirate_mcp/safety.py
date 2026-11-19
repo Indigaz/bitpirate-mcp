@@ -58,6 +58,14 @@ _TOOL_TIERS: dict[str, SafetyTier] = {
     "measure_pin": SafetyTier.READ_ONLY,
     "measure_frequency": SafetyTier.READ_ONLY,
     "capture": SafetyTier.READ_ONLY,
+    # DIO digital + PWM (Tier 3)
+    "set_pin": SafetyTier.ALLOWED_WRITE,
+    "read_pin": SafetyTier.READ_ONLY,
+    "pulse": SafetyTier.ALLOWED_WRITE,
+    "pull_up": SafetyTier.ALLOWED_WRITE,
+    "pull_down": SafetyTier.ALLOWED_WRITE,
+    "pwm_set": SafetyTier.ALLOWED_WRITE,
+    "pwm_stop": SafetyTier.ALLOWED_WRITE,
     # Logic Analyzer (FALA)
     # (Logic analyzer tools removed -- no FALA on the ESP32-Bit-Pirate)
 }

@@ -720,6 +720,109 @@ TOOL_DEFINITIONS = [
             "required": ["pin"],
         },
     ),
+    Tool(
+        name="set_pin",
+        description=(
+            "Drive a GPIO pin HIGH (level=true) or LOW (level=false). "
+            "[write] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+                "level": {"type": "boolean", "description": "true=HIGH, false=LOW"},
+            },
+            "required": ["pin", "level"],
+        },
+    ),
+    Tool(
+        name="read_pin",
+        description=(
+            "Read a GPIO pin and return its level (0=LOW, 1=HIGH). "
+            "[read-only] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+            },
+            "required": ["pin"],
+        },
+    ),
+    Tool(
+        name="pulse",
+        description=(
+            "Generate an inverse pulse on a GPIO pin for duration_us microseconds "
+            "(drives the opposite of the current level, then restores). "
+            "[write] [Duration: fast (duration_us).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+                "duration_us": {"type": "integer", "description": "Pulse width (us)"},
+            },
+            "required": ["pin", "duration_us"],
+        },
+    ),
+    Tool(
+        name="pull_up",
+        description=(
+            "Enable the internal pull-up resistor on a GPIO pin. "
+            "[write] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+            },
+            "required": ["pin"],
+        },
+    ),
+    Tool(
+        name="pull_down",
+        description=(
+            "Enable the internal pull-down resistor on a GPIO pin. "
+            "[write] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+            },
+            "required": ["pin"],
+        },
+    ),
+    Tool(
+        name="pwm_set",
+        description=(
+            "Start PWM output on a GPIO pin at freq_hz with duty_pct percent duty. "
+            "Use pwm_stop to stop it. [write] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+                "freq_hz": {"type": "integer", "description": "PWM frequency (Hz)"},
+                "duty_pct": {"type": "integer", "description": "Duty cycle (1-100 %)"},
+            },
+            "required": ["pin", "freq_hz", "duty_pct"],
+        },
+    ),
+    Tool(
+        name="pwm_stop",
+        description=(
+            "Stop PWM on a GPIO pin and reset it to a plain input (no pull). "
+            "[write] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+            },
+            "required": ["pin"],
+        },
+    ),
 ]
 
 
@@ -1020,6 +1123,60 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 pin=arguments["pin"],
                 samples=arguments.get("samples", 256),
                 delay_us=arguments.get("delay_us", 100),
+            )
+
+        # --- Tier 3: DIO digital + PWM ---
+        elif name == "set_pin":
+            hw = _get_hardware()
+            result = await tools.tool_set_pin(
+                hardware=hw,
+                pin=arguments["pin"],
+                level=arguments["level"],
+            )
+
+        elif name == "read_pin":
+            hw = _get_hardware()
+            result = await tools.tool_read_pin(
+                hardware=hw,
+                pin=arguments["pin"],
+            )
+
+        elif name == "pulse":
+            hw = _get_hardware()
+            result = await tools.tool_pulse(
+                hardware=hw,
+                pin=arguments["pin"],
+                duration_us=arguments["duration_us"],
+            )
+
+        elif name == "pull_up":
+            hw = _get_hardware()
+            result = await tools.tool_pull_up(
+                hardware=hw,
+                pin=arguments["pin"],
+            )
+
+        elif name == "pull_down":
+            hw = _get_hardware()
+            result = await tools.tool_pull_down(
+                hardware=hw,
+                pin=arguments["pin"],
+            )
+
+        elif name == "pwm_set":
+            hw = _get_hardware()
+            result = await tools.tool_pwm_set(
+                hardware=hw,
+                pin=arguments["pin"],
+                freq_hz=arguments["freq_hz"],
+                duty_pct=arguments["duty_pct"],
+            )
+
+        elif name == "pwm_stop":
+            hw = _get_hardware()
+            result = await tools.tool_pwm_stop(
+                hardware=hw,
+                pin=arguments["pin"],
             )
 
         # --- 1-Wire ---

@@ -773,6 +773,71 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("p5b-square-stop", T, sq_stop2,
                "B square stopped, SCL pin 44 released", "")
 
+    # --- Tier 3 (DIO digital + PWM).
+    # DIO set/read use A4 (-> B10): A's driver dominates B10's pull-up (m3 pattern).
+    # pull_up/pull_down use free internal GPIO1 (not wired to B -> clean).
+    # PWM: A drives pin 4 (-> B10); B's new v1.16 `MEASURE 10 <ms>` counts the edges.
+    hw = server._hardware
+
+    d = await mcp_call("set_pin", {"pin": 4, "level": True})
+    d2 = await mcp_call("read_pin", {"pin": 4})
+    d1_ok = (d2.get("level") == 1)
+    bat.record("d1-set-read-high", T, d1_ok,
+               f"set HIGH -> read {d2.get('level')} (expect 1)", json.dumps(d2)[:200])
+
+    d = await mcp_call("set_pin", {"pin": 4, "level": False})
+    d2 = await mcp_call("read_pin", {"pin": 4})
+    d2_ok = (d2.get("level") == 0)
+    bat.record("d2-set-read-low", T, d2_ok,
+               f"set LOW -> read {d2.get('level')} (expect 0)", json.dumps(d2)[:200])
+
+    hw.configure_pin_input(1)
+    d = await mcp_call("pull_up", {"pin": 1})
+    d2 = await mcp_call("read_pin", {"pin": 1})
+    d3_ok = (d2.get("level") == 1)
+    bat.record("d3-pull-up", T, d3_ok,
+               f"pull_up(1) -> read {d2.get('level')} (expect 1)", json.dumps(d2)[:200])
+
+    hw.configure_pin_input(1)
+    d = await mcp_call("pull_down", {"pin": 1})
+    d2 = await mcp_call("read_pin", {"pin": 1})
+    d4_ok = (d2.get("level") == 0)
+    bat.record("d4-pull-down", T, d4_ok,
+               f"pull_down(1) -> read {d2.get('level')} (expect 0)", json.dumps(d2)[:200])
+
+    await mcp_call("set_pin", {"pin": 4, "level": False})
+    d = await mcp_call("pulse", {"pin": 4, "duration_us": 500})
+    d2 = await mcp_call("read_pin", {"pin": 4})
+    d5_ok = ("error" not in d and d2.get("level") == 0)
+    bat.record("d5-pulse", T, d5_ok,
+               f"pulse(4,500us) -> read {d2.get('level')} (expect 0 = restored)",
+               json.dumps(d)[:200])
+    hw.release_pin(4)
+
+    d = await mcp_call("pwm_set", {"pin": 4, "freq_hz": 1000, "duty_pct": 50})
+    p6_ok = (d.get("freq_hz") == 1000 and d.get("duty_pct") == 50)
+    bat.record("p6-pwm-arm", T, p6_ok,
+               f"A PWM on 4 -> B10: {d.get('freq_hz')}Hz {d.get('duty_pct')}% duty",
+               json.dumps(d)[:200])
+
+    blog.write("MEASURE 10 2000")
+    fresh = blog.wait_new("MEASURE pin=", 6.0)
+    mp = re.search(
+        r"MEASURE pin=(\d+) rising=(\d+) falling=(\d+) freq=(\d+)Hz duty=([\d.]+)%",
+        fresh)
+    bfreq = int(mp.group(4)) if mp else 0
+    bduty = float(mp.group(5)) if mp else -1.0
+    p7_ok = (900 <= bfreq <= 1100 and 40 <= bduty <= 60)
+    bat.record("p7-pwm-measure", T, p7_ok,
+               f"B MEASURE: {fresh.strip()[-90:]}" if fresh.strip()
+               else "B MEASURE: (no output)", fresh.strip()[-200:])
+
+    d = await mcp_call("pwm_stop", {"pin": 4})
+    p8_ok = (d.get("pin") == 4)
+    bat.record("p8-pwm-stop", T, p8_ok,
+               f"A PWM stopped: pin {d.get('pin')} reset to INPUT", json.dumps(d)[:200])
+    hw.release_pin(4)
+
 
 def main() -> int:
     bat = Battery()

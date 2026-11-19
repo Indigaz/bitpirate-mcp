@@ -12,6 +12,8 @@ class TestClassifyTool:
             "spi_flash_analyze", "spi_flash_search", "spi_flash_strings",
             "i2c_scan", "i2c_read", "i2c_dump",
             "onewire_search", "onewire_read",
+            "measure_pin", "measure_frequency", "capture",
+            "read_pin",
         ]:
             assert classify_tool(tool) == SafetyTier.READ_ONLY
 
@@ -22,6 +24,7 @@ class TestClassifyTool:
             "open_spi", "close_spi", "spi_config",
             "open_i2c", "close_i2c",
             "open_1wire", "close_1wire",
+            "set_pin", "pulse", "pull_up", "pull_down", "pwm_set", "pwm_stop",
         ]:
             assert classify_tool(tool) == SafetyTier.ALLOWED_WRITE
 

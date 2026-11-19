@@ -930,6 +930,73 @@ async def tool_capture(
 
 
 # ---------------------------------------------------------------------------
+# Tier 3: DIO digital + PWM tools (DioController: set/read/pulse/pull/pwm/reset)
+# ---------------------------------------------------------------------------
+
+
+async def tool_set_pin(
+    hardware: Any,
+    pin: int,
+    level: bool,
+) -> dict[str, Any]:
+    """Drive a GPIO pin HIGH (level=true) or LOW (level=false)."""
+    hardware.set_pin_output(pin, level)
+    return {"pin": pin, "level": 1 if level else 0}
+
+
+async def tool_read_pin(
+    hardware: Any,
+    pin: int,
+) -> dict[str, Any]:
+    """Read a GPIO pin (0=LOW, 1=HIGH)."""
+    return {"pin": pin, "level": hardware.read_pin(pin)}
+
+
+async def tool_pulse(
+    hardware: Any,
+    pin: int,
+    duration_us: int,
+) -> dict[str, Any]:
+    """Inverse pulse on a GPIO pin for duration_us microseconds."""
+    hardware.pulse_pin(pin, duration_us)
+    return {"pin": pin, "duration_us": int(duration_us)}
+
+
+async def tool_pull_up(
+    hardware: Any,
+    pin: int,
+) -> dict[str, Any]:
+    """Enable the pull-up resistor on a GPIO pin."""
+    return hardware.pull_up(pin)
+
+
+async def tool_pull_down(
+    hardware: Any,
+    pin: int,
+) -> dict[str, Any]:
+    """Enable the pull-down resistor on a GPIO pin."""
+    return hardware.pull_down(pin)
+
+
+async def tool_pwm_set(
+    hardware: Any,
+    pin: int,
+    freq_hz: int,
+    duty_pct: int,
+) -> dict[str, Any]:
+    """Start PWM on a GPIO pin at freq_hz with duty_pct percent duty."""
+    return hardware.pwm(pin, freq_hz, duty_pct)
+
+
+async def tool_pwm_stop(
+    hardware: Any,
+    pin: int,
+) -> dict[str, Any]:
+    """Stop PWM on a GPIO pin and reset it to a plain input."""
+    return hardware.pwm_stop(pin)
+
+
+# ---------------------------------------------------------------------------
 # SPI tools (ESP32-Bit-Pirate: native flash shell + instruction syntax)
 # ---------------------------------------------------------------------------
 

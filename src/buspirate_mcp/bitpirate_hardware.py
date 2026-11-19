@@ -70,6 +70,14 @@ RE_FREQ_HIGH: re.Pattern = re.compile(rb"HIGH: ([\d.]+) us")
 RE_FREQ_CYCLES: re.Pattern = re.compile(rb"Cycles: (\d+)/(\d+)")
 RE_LOGICCAP: re.Pattern = re.compile(rb"LogicCap: (\d+) samples: ([0-9A-Fa-f]+)")
 
+# -- Tier 3: DIO digital + PWM (DioController: set/pulse/pullup/pulldown/pwm/reset) --
+RE_DIO_SET: re.Pattern = re.compile(rb"DIO Set: (?:Pin|GPIO) (\d+) set to (HIGH|LOW|INPUT|OUTPUT)")
+RE_DIO_PULSE: re.Pattern = re.compile(rb"DIO Pulse: GPIO (\d+) pulsed (HIGH|LOW) for (\d+) us")
+RE_DIO_PULLUP: re.Pattern = re.compile(rb"DIO Pullup: Set on GPIO (\d+)")
+RE_DIO_PULLDOWN: re.Pattern = re.compile(rb"DIO Pulldown: Set on GPIO (\d+)")
+RE_DIO_PWM: re.Pattern = re.compile(rb"DIO PWM: GPIO (\d+) \((\d+)Hz, (\d+)% duty\)")
+RE_DIO_RESET: re.Pattern = re.compile(rb"DIO Reset: GPIO (\d+) to INPUT")
+
 # -- SPI flash (v1.8 source: SpiFlashShell.cpp, UserInputManager.cpp) --
 SPI_MENU_MARK = b"=== SPI Flash Shell ==="
 DUMP_DONE_MARK = b"SPI Flash Dump: Done."
@@ -321,6 +329,57 @@ class BitPirateHardware:
         """+  DIO toggle: repeat H/L for duration_ms."""
         self._validate_pin(pin)
         self._dio("toggle", str(pin), str(int(duration_ms)))
+
+    def pull_up(self, pin: int) -> dict:
+        """+  DIO pullup: enable pull-up on pin (Tier 3)."""
+        self._validate_pin(pin)
+        t = self._dio("pullup", str(pin))
+        m = RE_DIO_PULLUP.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse pullup result for pin {pin}", t.decode("utf-8", "replace")
+            )
+        return {"pin": int(m.group(1))}
+
+    def pull_down(self, pin: int) -> dict:
+        """+  DIO pulldown: enable pull-down on pin (Tier 3)."""
+        self._validate_pin(pin)
+        t = self._dio("pulldown", str(pin))
+        m = RE_DIO_PULLDOWN.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse pulldown result for pin {pin}", t.decode("utf-8", "replace")
+            )
+        return {"pin": int(m.group(1))}
+
+    def pwm(self, pin: int, freq_hz: int, duty_pct: int) -> dict:
+        """+  DIO pwm: start PWM on pin (freq Hz, duty %). Bounded when all
+        args are supplied (else the firmware prompts interactively)."""
+        self._validate_pin(pin)
+        freq = int(freq_hz)
+        duty = int(duty_pct)
+        if freq < 1:
+            raise ValueError(f"freq_hz must be >= 1, got: {freq}")
+        if not 1 <= duty <= 100:
+            raise ValueError(f"duty_pct must be 1..100, got: {duty}")
+        t = self._dio("pwm", str(pin), str(freq), str(duty))
+        m = RE_DIO_PWM.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse pwm result for pin {pin}", t.decode("utf-8", "replace")
+            )
+        return {"pin": int(m.group(1)), "freq_hz": int(m.group(2)), "duty_pct": int(m.group(3))}
+
+    def pwm_stop(self, pin: int) -> dict:
+        """+  DIO reset: stop any PWM on pin + set to INPUT (no pull)."""
+        self._validate_pin(pin)
+        t = self._dio("reset", str(pin))
+        m = RE_DIO_RESET.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse pwm_stop result for pin {pin}", t.decode("utf-8", "replace")
+            )
+        return {"pin": int(m.group(1))}
 
     def measure_pin(self, pin: int, duration_ms: int = 2000) -> dict:
         """+  DIO measure: edge counter + approximate frequency (signal

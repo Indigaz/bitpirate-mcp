@@ -199,6 +199,58 @@ def test_pulse_pin(hw):
     assert "pulse 42 1000" in fake.lines_sent
 
 
+def test_pull_up_parses_pin(hw):
+    h, fake = hw
+    fake.expect("mode dio", "DIO> ")
+    fake.expect("pullup 42", "DIO Pullup: Set on GPIO 42\rDIO> ")
+    r = h.pull_up(42)
+    assert r == {"pin": 42}
+    assert "pullup 42" in fake.lines_sent
+
+
+def test_pull_down_parses_pin(hw):
+    h, fake = hw
+    fake.expect("mode dio", "DIO> ")
+    fake.expect("pulldown 42", "DIO Pulldown: Set on GPIO 42\rDIO> ")
+    r = h.pull_down(42)
+    assert r == {"pin": 42}
+    assert "pulldown 42" in fake.lines_sent
+
+
+def test_pwm_parses_freq_and_duty(hw):
+    h, fake = hw
+    fake.expect("mode dio", "DIO> ")
+    fake.expect(
+        "pwm 42 1000 50",
+        "DIO PWM: GPIO 42 (1000Hz, 50% duty)... Use 'reset 42'\rDIO> ",
+    )
+    r = h.pwm(42, 1000, 50)
+    assert r == {"pin": 42, "freq_hz": 1000, "duty_pct": 50}
+    assert "pwm 42 1000 50" in fake.lines_sent
+
+
+def test_pwm_validates_ranges(hw):
+    h, _ = hw
+    with pytest.raises(ValueError, match="freq_hz"):
+        h.pwm(42, 0, 50)
+    with pytest.raises(ValueError, match="duty_pct"):
+        h.pwm(42, 1000, 0)
+    with pytest.raises(ValueError, match="duty_pct"):
+        h.pwm(42, 1000, 101)
+
+
+def test_pwm_stop_parses_pin(hw):
+    h, fake = hw
+    fake.expect("mode dio", "DIO> ")
+    fake.expect(
+        "reset 42",
+        "DIO Reset: GPIO 42 to INPUT (no pull-up, no PWM).\rDIO> ",
+    )
+    r = h.pwm_stop(42)
+    assert r == {"pin": 42}
+    assert "reset 42" in fake.lines_sent
+
+
 def test_measure_pin_parses_edges_and_freq(hw):
     h, fake = hw
     fake.expect("mode dio", "DIO> ")
