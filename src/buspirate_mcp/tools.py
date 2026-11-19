@@ -896,6 +896,40 @@ async def tool_close_i2c(
 
 
 # ---------------------------------------------------------------------------
+# Scope / Measure tools (Phase 5: PinAnalyzer, I2C SCL freq, logic capture)
+# ---------------------------------------------------------------------------
+
+
+async def tool_measure_pin(
+    hardware: Any,
+    pin: int,
+    duration_ms: int = 2000,
+) -> dict[str, Any]:
+    """Full PinAnalyzer signal report for a GPIO pin (edges, duty, freq,
+    jitter, classified guess)."""
+    return hardware.analyze_pin(pin, duration_ms)
+
+
+async def tool_measure_frequency(
+    hardware: Any,
+    duration_ms: int = 2000,
+    scl_pin: int | None = None,
+) -> dict[str, Any]:
+    """I2C SCL clock frequency (or any clock on a pin) via the RMT analyzer."""
+    return hardware.i2c_frequency(duration_ms, scl_pin)
+
+
+async def tool_capture(
+    hardware: Any,
+    pin: int,
+    samples: int = 256,
+    delay_us: int = 100,
+) -> dict[str, Any]:
+    """Logic waveform capture on a GPIO pin as a hex stream + level list."""
+    return hardware.capture_logic(pin, samples, delay_us)
+
+
+# ---------------------------------------------------------------------------
 # SPI tools (ESP32-Bit-Pirate: native flash shell + instruction syntax)
 # ---------------------------------------------------------------------------
 

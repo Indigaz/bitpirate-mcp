@@ -651,6 +651,75 @@ TOOL_DEFINITIONS = [
             "required": ["session_id"],
         },
     ),
+    Tool(
+        name="measure_pin",
+        description=(
+            "Full signal analysis of a GPIO pin: edge rate, duty cycle, "
+            "approximate frequency, jitter, and a classified signal guess "
+            "(Idle/Noise/Clock/PWM/Servo/DataLike/Burst) from the firmware "
+            "PinAnalyzer. [read-only] [Duration: fast (samples for duration_ms, default 2000).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO to analyze (0-48)"},
+                "duration_ms": {
+                    "type": "integer",
+                    "default": 2000,
+                    "description": "Sample window (ms, max 8000)",
+                },
+            },
+            "required": ["pin"],
+        },
+    ),
+    Tool(
+        name="measure_frequency",
+        description=(
+            "Measure the SCL clock frequency of an I2C bus (or any clock on a "
+            "pin) using the hardware RMT analyzer. Returns frequency, period, "
+            "LOW/HIGH times, and cycle counts. [read-only] [Duration: fast (measures for duration_ms, default 2000).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "duration_ms": {
+                    "type": "integer",
+                    "default": 2000,
+                    "description": "Measurement window (ms, max 10000)",
+                },
+                "scl_pin": {
+                    "type": "integer",
+                    "description": "Optional GPIO to measure as SCL (reconfigures I2C SCL, then restores)",
+                },
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="capture",
+        description=(
+            "Capture a logic waveform on a GPIO pin as a compact hex stream "
+            "(one hex char per 4 samples) plus the expanded level list. "
+            "[read-only] [Duration: fast (samples * delay_us).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO to capture (0-48)"},
+                "samples": {
+                    "type": "integer",
+                    "default": 256,
+                    "description": "Number of samples (max 1024)",
+                },
+                "delay_us": {
+                    "type": "integer",
+                    "default": 100,
+                    "description": "Sample interval (us, max 10000)",
+                },
+            },
+            "required": ["pin"],
+        },
+    ),
 ]
 
 
@@ -925,6 +994,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 session_manager=session_manager,
                 session_id=arguments["session_id"],
                 hardware=_get_hardware(),
+            )
+
+        # --- scope / measure (Phase 5) ---
+        elif name == "measure_pin":
+            hw = _get_hardware()
+            result = await tools.tool_measure_pin(
+                hardware=hw,
+                pin=arguments["pin"],
+                duration_ms=arguments.get("duration_ms", 2000),
+            )
+
+        elif name == "measure_frequency":
+            hw = _get_hardware()
+            result = await tools.tool_measure_frequency(
+                hardware=hw,
+                duration_ms=arguments.get("duration_ms", 2000),
+                scl_pin=arguments.get("scl_pin"),
+            )
+
+        elif name == "capture":
+            hw = _get_hardware()
+            result = await tools.tool_capture(
+                hardware=hw,
+                pin=arguments["pin"],
+                samples=arguments.get("samples", 256),
+                delay_us=arguments.get("delay_us", 100),
             )
 
         # --- 1-Wire ---

@@ -59,6 +59,17 @@ RE_MEASURE_RISING: re.Pattern = re.compile(rb"Rising edges:\s+(\d+)")
 RE_MEASURE_FALLING: re.Pattern = re.compile(rb"Falling edges:\s+(\d+)")
 RE_MEASURE_FREQ: re.Pattern = re.compile(rb"Approx\. frequency: ([\d.]+) Hz")
 
+# -- Phase 5: scope/measure (PinAnalyzer `wizreport`, I2C `freqms`, `logiccap`) --
+RE_WIZ_TOP: re.Pattern = re.compile(rb"Top guess: (\w+) \((\d+)%\)")
+RE_WIZ_HZ: re.Pattern = re.compile(rb"~(\d+) Hz, (\d+)% HIGH")
+RE_WIZ_TECH: re.Pattern = re.compile(rb"Report: edges/sec=(\d+) duty=(\d+)% jitter~(\d+)%")
+RE_FREQ_KHZ: re.Pattern = re.compile(rb"Freq: ([\d.]+) kHz")
+RE_FREQ_PERIOD: re.Pattern = re.compile(rb"Period: ([\d.]+) us")
+RE_FREQ_LOW: re.Pattern = re.compile(rb"LOW: ([\d.]+) us")
+RE_FREQ_HIGH: re.Pattern = re.compile(rb"HIGH: ([\d.]+) us")
+RE_FREQ_CYCLES: re.Pattern = re.compile(rb"Cycles: (\d+)/(\d+)")
+RE_LOGICCAP: re.Pattern = re.compile(rb"LogicCap: (\d+) samples: ([0-9A-Fa-f]+)")
+
 # -- SPI flash (v1.8 source: SpiFlashShell.cpp, UserInputManager.cpp) --
 SPI_MENU_MARK = b"=== SPI Flash Shell ==="
 DUMP_DONE_MARK = b"SPI Flash Dump: Done."
@@ -336,6 +347,105 @@ class BitPirateHardware:
         detector). Return None per upstream contract."""
         return None
 
+    # -- Phase 5: scope / measure (PinAnalyzer, I2C SCL freq, logic capture) --
+
+    def _util(self, text: str, timeout: float) -> bytes:
+        """Global utility command (wizreport/logiccap). These are global roots
+        (handled by UtilityController in any mode); ensure a clean DIO base
+        mode first so the pin is not mid-protocol."""
+        if self._active_mode != "dio":
+            self._set_mode("dio")
+        return self._cmd(text, timeout)
+
+    def analyze_pin(self, pin: int, duration_ms: int = 2000) -> dict:
+        """Full PinAnalyzer report (edges, duty, freq, jitter, classified
+        guess) via the bounded `wizreport <gpio> [ms]` command."""
+        self._validate_pin(pin)
+        dur = max(100, min(int(duration_ms), 8000))
+        t = self._util(f"wizreport {pin} {dur}", timeout=(dur / 1000.0) + 6.0)
+        txt = t.decode("utf-8", "replace")
+        top = RE_WIZ_TOP.search(t)
+        if not top:
+            raise BitPirateCLIError(f"Cannot parse wizreport for pin {pin}", txt)
+        hz = RE_WIZ_HZ.search(t)
+        tech = RE_WIZ_TECH.search(t)
+        return {
+            "pin": pin,
+            "duration_ms": dur,
+            "top1_kind": top.group(1).decode("utf-8", "replace"),
+            "top1_confidence_pct": int(top.group(2)),
+            "approx_hz": float(hz.group(1)) if hz else 0.0,
+            "duty_pct": int(hz.group(2)) if hz else (int(tech.group(2)) if tech else 0),
+            "edges_per_sec": int(tech.group(1)) if tech else 0,
+            "jitter_pct": int(tech.group(3)) if tech else 0,
+            "raw": txt,
+        }
+
+    def capture_logic(self, pin: int, samples: int = 256, delay_us: int = 100) -> dict:
+        """Logic waveform capture as hex levels via
+        `logiccap <gpio> <samples> [delay_us]` (one hex char per 4 samples)."""
+        self._validate_pin(pin)
+        n = max(8, min(int(samples), 1024))
+        d = max(1, min(int(delay_us), 10000))
+        t = self._util(f"logiccap {pin} {n} {d}", timeout=8.0)
+        m = RE_LOGICCAP.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse logiccap for pin {pin}", t.decode("utf-8", "replace")
+            )
+        hexstr = m.group(2).decode("ascii")
+        levels: list[int] = []
+        for ch in hexstr:
+            v = int(ch, 16)
+            levels += [(v >> 3) & 1, (v >> 2) & 1, (v >> 1) & 1, v & 1]
+        return {
+            "pin": pin,
+            "samples": int(m.group(1)),
+            "delay_us": d,
+            "hex": hexstr,
+            "levels": levels,
+            "raw": t.decode("utf-8", "replace"),
+        }
+
+    def i2c_frequency(self, duration_ms: int = 2000, scl_pin: int | None = None) -> dict:
+        """I2C SCL clock frequency via the bounded `freqms <ms>` command.
+
+        scl_pin: optionally reconfigure the I2C SCL pin before measuring (e.g.
+        to a pin carrying an external clock), then restore the prior SCL pin.
+        """
+        dur = max(50, min(int(duration_ms), 10000))
+        prev_scl = self.i2c_scl
+        try:
+            if scl_pin is not None:
+                self._validate_pin(scl_pin)
+                self.i2c_scl = scl_pin
+                self.configure_i2c(self.i2c_speed)
+            else:
+                self._ensure_i2c()
+            t = self._cmd(f"freqms {dur}", timeout=(dur / 1000.0) + 8.0)
+        finally:
+            if scl_pin is not None:
+                self.i2c_scl = prev_scl
+                self.configure_i2c(self.i2c_speed)
+        freq = RE_FREQ_KHZ.search(t)
+        if not freq:
+            raise BitPirateCLIError(
+                "Cannot parse freqms result", t.decode("utf-8", "replace")
+            )
+        period = RE_FREQ_PERIOD.search(t)
+        low = RE_FREQ_LOW.search(t)
+        high = RE_FREQ_HIGH.search(t)
+        cycles = RE_FREQ_CYCLES.search(t)
+        return {
+            "frequency_hz": float(freq.group(1)) * 1000.0,
+            "period_us": float(period.group(1)) if period else 0.0,
+            "low_us": float(low.group(1)) if low else 0.0,
+            "high_us": float(high.group(1)) if high else 0.0,
+            "accepted_cycles": int(cycles.group(1)) if cycles else 0,
+            "captured_cycles": int(cycles.group(2)) if cycles else 0,
+            "reliable": True,
+            "raw": t.decode("utf-8", "replace"),
+        }
 
     # -- SPI / flash (Phase 2) --
 

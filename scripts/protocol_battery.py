@@ -721,6 +721,58 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("u12-close-uart", T, d.get("closed") is True,
                "uart session closed", json.dumps(d)[:300])
 
+    # --- Phase 5 (scope/measure): PinAnalyzer, I2C SCL freq, logic capture.
+    # B's 1 kHz square (pin 15 -> A44) is the known signal source. SQUARE/STOP
+    # go via B's OWN console (pin 15 is owned by u1 until u1.end(), so B cannot
+    # GPIO-drive it while UART1 is up).
+    blog.write("SQUARE")
+    sq_arm = blog.wait_for("SQUARE 1kHz", 5.0)
+    bat.record("p1-square-arm", T, sq_arm,
+               "B 1 kHz square armed on pin 15 (-> A44)", "")
+
+    d = await mcp_call("measure_pin", {"pin": 44, "duration_ms": 2000})
+    kind = d.get("top1_kind")
+    hz = d.get("approx_hz", 0)
+    duty = d.get("duty_pct")
+    analyze_ok = (sq_arm and kind in ("Clock", "PWM")
+                  and 700 <= hz <= 1300 and 40 <= (duty or 0) <= 60)
+    bat.record("p2-analyze-square", T, analyze_ok,
+               f"top={kind}({d.get('top1_confidence_pct')}%) hz={hz} "
+               f"duty={duty}% edges/s={d.get('edges_per_sec')}"
+               if sq_arm else "B square not armed", json.dumps(d)[:300])
+
+    d = await mcp_call("capture", {"pin": 44, "samples": 256, "delay_us": 100})
+    levels = d.get("levels", [])
+    highs = sum(levels)
+    cap_ok = (sq_arm and len(levels) == 256 and 96 <= highs <= 160)
+    bat.record("p3-capture-square", T, cap_ok,
+               f"{highs}/256 HIGH (~{100 * highs // max(len(levels), 1)}% duty) "
+               f"hex={d.get('hex', '')[:16]}..." if sq_arm
+               else "B square not armed", json.dumps(d)[:300])
+
+    blog.write("STOP")
+    sq_stop = blog.wait_for("STOP (out=15 low", 5.0)
+    bat.record("p4-square-stop", T, sq_stop,
+               "B square stopped, u1 restored", "")
+
+    # measure_frequency: point A's I2C SCL at the square pin (44). Re-arm the
+    # square; the driver reconfigures I2C SCL->44, runs the bounded freqms, and
+    # restores SCL; then stop the square (releases pin 44).
+    blog.write("SQUARE")
+    sq_arm2 = blog.wait_for("SQUARE 1kHz", 5.0)
+    d = await mcp_call("measure_frequency", {"duration_ms": 2000, "scl_pin": 44})
+    f_hz = d.get("frequency_hz", 0)
+    freq_ok = (sq_arm2 and d.get("reliable") is True and 700 <= f_hz <= 1300)
+    bat.record("p5-i2c-frequency", T, freq_ok,
+               f"SCL(44) freq={f_hz} Hz period={d.get('period_us')}us "
+               f"cycles={d.get('accepted_cycles')}/{d.get('captured_cycles')}"
+               if sq_arm2 else "B square not armed", json.dumps(d)[:300])
+
+    blog.write("STOP")
+    sq_stop2 = blog.wait_for("STOP (out=15 low", 5.0)
+    bat.record("p5b-square-stop", T, sq_stop2,
+               "B square stopped, SCL pin 44 released", "")
+
 
 def main() -> int:
     bat = Battery()
