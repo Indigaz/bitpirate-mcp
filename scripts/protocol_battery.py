@@ -151,7 +151,10 @@ class BLog:
 
     def _run(self) -> None:
         while self.alive:
-            d = self.ser.read(64)
+            try:
+                d = self.ser.read(64)
+            except Exception:
+                break  # port closed during read (teardown)
             if d:
                 with self.lock:
                     self.buf.append(d.decode("utf-8", "replace"))
@@ -188,6 +191,10 @@ class BLog:
         self.alive = False
         try:
             self.ser.close()
+        except Exception:
+            pass
+        try:
+            self.thread.join(timeout=2.0)
         except Exception:
             pass
 
@@ -492,12 +499,16 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
 
     pre = blog.snapshot()
     d = await mcp_call("enter_download_mode", {"boot_pin": 2, "reset_pin": 4})
+    # A4 is left driven LOW by the audit (A's 'hiz' does not release pins),
+    # so the pulse's visible edge on B10 is the RISING one (the pulse ends
+    # HIGH) — "MIRROR in=1" is present regardless of A4's start level.
     fresh = blog.wait_new("MIRROR in=1", 8.0)
     seq_ok = (d.get("status") == "download_mode_entered")
-    obs = ("MIRROR in=0" in fresh) and ("MIRROR in=1" in fresh)
+    obs = "MIRROR in=1" in fresh
     bat.record("m3-enter-download-mode", T, seq_ok and obs,
-               "DIO sequence executed; B mirror saw reset pin low->high"
-               if obs else "B mirror did not log transitions in this sequence", json.dumps(d)[:300])
+               "DIO sequence executed; B mirror saw reset pin rise"
+               if obs else "B mirror did not log the rising edge: " + fresh[-150:],
+               json.dumps(d)[:200] + " | B-console: " + fresh[-250:])
 
     # Release B's GPIO mirror NOW (m3 was its last consumer): mirror mode
     # holds pin 15 — wired to A's UART RX (GPIO 44) — LOW, so A's UART1
