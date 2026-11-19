@@ -54,6 +54,10 @@ _TOOL_TIERS: dict[str, SafetyTier] = {
     "onewire_search": SafetyTier.READ_ONLY,
     "onewire_read": SafetyTier.READ_ONLY,
     "close_1wire": SafetyTier.ALLOWED_WRITE,
+    # Scope / Measure (Phase 5)
+    "measure_pin": SafetyTier.READ_ONLY,
+    "measure_frequency": SafetyTier.READ_ONLY,
+    "capture": SafetyTier.READ_ONLY,
     # Logic Analyzer (FALA)
     # (Logic analyzer tools removed -- no FALA on the ESP32-Bit-Pirate)
 }
