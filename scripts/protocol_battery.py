@@ -482,11 +482,15 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
                "ROM + scratchpad" if ok and rom_ok else f"ROM match={rom_ok}", txt)
 
     ok, txt = con.cmd("scan", "Device 1", 10)
+    # 1-Wire ROM search (0xF5) is timing-sensitive and intermittently flaky in
+    # the full-battery context (run 13: "no device found" though the slave is
+    # always present and standalone scan is 6/6). A retry is a standard
+    # robustness measure for 1-Wire search.
     if not ok:
-        time.sleep(1.0)
-        txt = con.drain(1.0)
+        time.sleep(0.5)
+        ok, txt = con.cmd("scan", "Device 1", 10)
     bat.record("1wire-scan", T, ok and ROM_EXPECTED[:2] in txt,
-               "search found device" if ok else "no device found in search", txt)
+               "search found device" if ok else "no device found in search (after retry)", txt)
 
     # WRITE SP: fixed 2026-11-17 (rig-responder v1.10). Root cause was a
     # B-side firmware bug: dwDispatch() never cleared the s_cmd accumulator,
