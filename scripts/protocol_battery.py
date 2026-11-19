@@ -122,6 +122,18 @@ class BLog:
         self.thread.start()
         if do_reset:
             self.reset_board()
+            # CH340 RX can be dead right after rapid re-resets (flash +
+            # manual checks + this reset): verify the console answers a MODE
+            # probe; a dead B console fails every later B-side step (run 5).
+            if not self.wait_for("RIG-RESPONDER", 5.0):
+                self.reset_board()
+                self.wait_for("RIG-RESPONDER", 5.0)
+            self.write("AUDIT 0")
+            if not self.wait_for("AUDIT end:", 5.0):
+                self.reset_board()
+                self.wait_for("RIG-RESPONDER", 5.0)
+                self.write("AUDIT 0")
+                self.wait_for("AUDIT end:", 5.0)
 
     def reset_board(self) -> None:
         """esptool-style reset: B boots fresh (u1 up, mirror off, banner captured)."""
@@ -149,6 +161,28 @@ class BLog:
     def snapshot(self) -> str:
         with self.lock:
             return "".join(self.buf)
+
+    def wait_for(self, text: str, timeout: float = 5.0) -> bool:
+        """Poll the captured B console until `text` appears (True) or timeout."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if text in self.snapshot():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def wait_new(self, text: str, timeout: float = 6.0) -> str:
+        """Text appended after this call; wait until `text` appears in it."""
+        start = len(self.snapshot())
+        end = time.time() + timeout
+        while time.time() < end:
+            cur = self.snapshot()
+            fresh = cur[start:] if len(cur) >= start else cur
+            if text in fresh:
+                return fresh
+            time.sleep(0.1)
+        cur = self.snapshot()
+        return cur[start:] if len(cur) >= start else cur
 
     def close(self) -> None:
         self.alive = False
@@ -227,13 +261,8 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
             time.sleep(0.25)
             con.drain(0.02)
     con.cmd("mode hiz", "HIZ>", 4)
-    t0 = time.time()
-    audit_txt = ""
-    while time.time() - t0 < 12:
-        audit_txt = blog.snapshot()
-        if "AUDIT end:" in audit_txt:
-            break
-        time.sleep(0.1)
+    # wait for the FRESH AUDIT end (the boot liveness probe already logged one)
+    audit_txt = blog.wait_new("AUDIT end:", 15.0)
     m = re.search(r"AUDIT end:.*", audit_txt)
     audit_line = m.group(0).strip() if m else ""
     bat.record("audit-wiring", T, bool(audit_line),
@@ -286,8 +315,8 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     bat.record("dio-mode", T, ok, "", txt)
 
     blog.write("SQUARE")
-    time.sleep(0.3)
-    bat.record("dio-square-arm", T, "SQUARE 1kHz" in blog.snapshot(),
+    arm = blog.wait_for("SQUARE 1kHz", 5.0)
+    bat.record("dio-square-arm", T, arm,
                "B square wave armed via B console (u1 ended)", "")
 
     b_before = blog.snapshot()
@@ -300,16 +329,15 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
                txt + "\n[B-console-during-measure] " + b_during[:500])
 
     blog.write("STOP")
-    time.sleep(0.3)
-    bat.record("dio-square-stop", T, "STOP (out=15 low" in blog.snapshot(),
+    stopped = blog.wait_for("STOP (out=15 low", 5.0)
+    bat.record("dio-square-stop", T, stopped,
                "B square wave stopped, u1 restored", "")
 
     # Arm B's GPIO mirror via A's UART (last: ends B's UART1 permanently;
     # mirror stays armed for the MCP tier).
     ok, txt = con.cmd("mode uart", "UART>", 4)
     ok2, txt2 = con.cmd(f"write hex{{{GPIO_NL}}}", "UART Write:", 4)
-    time.sleep(0.4)
-    arm = "MODE=GPIO" in blog.snapshot()
+    arm = blog.wait_for("MODE=GPIO", 6.0)
     bat.record("dio-mirror-arm", T, ok and ok2 and arm,
                "B switched to GPIO mirror mode" if arm else "no MODE=GPIO on B console", txt2)
 
@@ -334,8 +362,7 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     # 0x00 stream on A's UART1 RX. The mirror is re-armed right before
     # m3 (its last consumer) via the B console (m3a-arm-mirror).
     blog.write("UART")
-    time.sleep(0.4)
-    fresh = blog.snapshot()
+    fresh = blog.wait_new("MODE=UART (pin15 restored", 5.0)
     released = "MODE=UART (pin15 restored" in fresh
     bat.record("dio-mirror-release", T, released,
                "B pin 15 back to UART1 TX (mirror released)"
@@ -449,10 +476,8 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
 
     # Re-arm B's GPIO mirror via its console (it was released after the
     # dio tier): m3 observes the reset-pin pulse on the mirror.
-    pre = blog.snapshot()
     blog.write("GPIO")
-    time.sleep(0.4)
-    fresh = blog.snapshot()
+    fresh = blog.wait_new("MODE=GPIO", 6.0)
     armed = "MODE=GPIO" in fresh
     bat.record("m3a-arm-mirror", T, armed,
                "B mirror armed (in=10 -> out=15)" if armed
@@ -460,8 +485,7 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
 
     pre = blog.snapshot()
     d = await mcp_call("enter_download_mode", {"boot_pin": 2, "reset_pin": 4})
-    post = blog.snapshot()
-    fresh = post[len(pre):] if post.startswith(pre) else post
+    fresh = blog.wait_new("MIRROR in=1", 8.0)
     seq_ok = (d.get("status") == "download_mode_entered")
     obs = ("MIRROR in=0" in fresh) and ("MIRROR in=1" in fresh)
     bat.record("m3-enter-download-mode", T, seq_ok and obs,
@@ -475,9 +499,7 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     # restored. Without this, u9/u10 read NULs and 1-Wire times out.
     pre = blog.snapshot()
     blog.write("UART")
-    time.sleep(0.4)
-    post = blog.snapshot()
-    fresh = post[len(pre):] if post.startswith(pre) else post
+    fresh = blog.wait_new("MODE=UART (pin15 restored", 5.0)
     released = "MODE=UART (pin15 restored" in fresh
     bat.record("m3b-release-mirror", T, released,
                "B pin 15 back to UART1 TX (mirror released)"
