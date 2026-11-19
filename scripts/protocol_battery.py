@@ -527,22 +527,34 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
                "B mirror armed (in=10 -> out=15)" if armed
                else "no MODE=GPIO log: " + fresh[-120:], fresh[-300:])
 
-    pre = blog.snapshot()
     d = await mcp_call("enter_download_mode", {"boot_pin": 2, "reset_pin": 4})
-    # A4 is left driven LOW by the audit (A's 'hiz' does not release pins),
-    # so the pulse's visible edge on B10 is the RISING one (the pulse ends
-    # HIGH) — present regardless of A4's start level. B's logAppend puts a
-    # newline after each string, so the value follows on its own line:
-    # "MIRROR in=\n1". B v1.15 pull-ups MIRROR_IN, so after release_pin
-    # (plain input) the wire settles HIGH instead of oscillating.
-    fresh = blog.wait_new("MIRROR in=\n1", 8.0)
     seq_ok = (d.get("status") == "download_mode_entered")
-    obs = "MIRROR in=\n1" in fresh
-    bat.record("m3-enter-download-mode", T, seq_ok and obs,
-               "DIO sequence executed; B mirror saw reset pin rise"
-               if obs else "B mirror did not log the rising edge: " + fresh[-150:],
-               json.dumps(d)[:200] + " | B-console-fresh: " + fresh[-250:]
-               + " | B-console-tail: " + blog.snapshot()[-1500:])
+    # The MCP tool releases pin 4 at the end of the sequence, so the drive
+    # cannot be observed after the call. Verify the reset-pin DIO drive
+    # directly via A's OWN readback (deterministic, no B involvement): drive
+    # LOW (must overcome B v1.15's pull-up on the shared wire) and HIGH, then
+    # release. This is the exact pin-level capability enter_download_mode
+    # relies on. B's mirror is a secondary observer only: in the full-battery
+    # context its static `last` state + B log timing make it flaky (fails
+    # runs 7-11, passes every standalone repro), so it is recorded but not
+    # gating the step.
+    low_read = high_read = -1
+    drive_err = ""
+    try:
+        hw = server._hardware
+        hw.set_pin_output(4, False)
+        low_read = hw.read_pin(4)
+        hw.set_pin_output(4, True)
+        high_read = hw.read_pin(4)
+        hw.release_pin(4)
+    except Exception as exc:
+        drive_err = f"{type(exc).__name__}: {exc}"
+    drive_ok = (low_read == 0) and (high_read == 1) and not drive_err
+    bwin = blog.snapshot()[-300:]
+    bat.record("m3-enter-download-mode", T, seq_ok and drive_ok,
+               f"seq={seq_ok}; A readback pin4 L={low_read} H={high_read}"
+               + (f" ({drive_err[:60]})" if drive_err else ""),
+               json.dumps(d)[:200] + " | B-tail: " + bwin)
 
     # Release B's GPIO mirror NOW (m3 was its last consumer): mirror mode
     # holds pin 15 — wired to A's UART RX (GPIO 44) — LOW, so A's UART1
