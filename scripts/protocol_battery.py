@@ -541,7 +541,8 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("m3-enter-download-mode", T, seq_ok and obs,
                "DIO sequence executed; B mirror saw reset pin rise"
                if obs else "B mirror did not log the rising edge: " + fresh[-150:],
-               json.dumps(d)[:200] + " | B-console: " + fresh[-250:])
+               json.dumps(d)[:200] + " | B-console-fresh: " + fresh[-250:]
+               + " | B-console-tail: " + blog.snapshot()[-1500:])
 
     # Release B's GPIO mirror NOW (m3 was its last consumer): mirror mode
     # holds pin 15 — wired to A's UART RX (GPIO 44) — LOW, so A's UART1
@@ -721,6 +722,9 @@ def main() -> int:
     server._hardware_port = A_PORT
     asyncio.run(run_mcp_tier(bat, blog))
     blog.close()
+    if os.environ.get("BATTERY_LOG_B"):
+        with open(os.environ["BATTERY_LOG_B"], "w") as f:
+            f.write(blog.snapshot())
 
     s = bat.summary()
     print("=" * 60)
