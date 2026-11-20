@@ -188,6 +188,22 @@ class BLog:
         cur = self.snapshot()
         return cur[start:] if len(cur) >= start else cur
 
+    def wait_new_re(self, pattern: str, timeout: float = 6.0) -> str:
+        """Like wait_new but `pattern` is a regex (re.search). Needed for
+        B's split logs: logAppend() ends with a newline, so 'MIRROR in='
+        and the number land on separate lines ('MIRROR in=\\n0')."""
+        rx = re.compile(pattern)
+        start = len(self.snapshot())
+        end = time.time() + timeout
+        while time.time() < end:
+            cur = self.snapshot()
+            fresh = cur[start:] if len(cur) >= start else cur
+            if rx.search(fresh):
+                return fresh
+            time.sleep(0.1)
+        cur = self.snapshot()
+        return cur[start:] if len(cur) >= start else cur
+
     def close(self) -> None:
         self.alive = False
         try:
@@ -314,6 +330,14 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
 
     # ---------- UART tier ----------
     ok, txt = con.cmd("mode uart", "UART>", 4)
+    # Fresh boot (or any full state reset) makes mode entry walk the config
+    # prompts before the UART> banner — answer the walk if it appeared;
+    # the explicit 'config' step below re-applies deterministically.
+    if not ok and "RX GPIO number" in txt:
+        for a in [str(UART_RX), str(UART_TX), "115200", "8", "N", "1", "n"]:
+            time.sleep(0.15)
+            con.send(a)
+        ok, txt = con.wait("onfigured.", 15)
     bat.record("uart-mode", T, ok, "", txt)
 
     # config: RX, TX, baud, data bits, parity, stop bits, inverted?
@@ -329,23 +353,25 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     bat.record("uart-write-ping", T, ok and "sent 5 bytes" in txt,
                "A sent PING\\n (5 bytes)" if ok else "no write confirmation", txt)
 
-    con.send("read")
-    stream = con.drain(1.2)          # B sends PONG x10 over 500ms; A's read flushes at start
-    con.send("")                     # Enter stops streaming
-    ok, txt = con.wait("Stopped", 5)
-    pong = "PONG" in (stream + txt)
+    # A's interactive `read` FLUSHES (discards) the RX buffer at start, but
+    # B's PONG x10 burst (500 ms) usually finishes while A is still doing
+    # the console round-trip — the flush swallows the PONGs and the stream
+    # captures only B's echo-noise (the fresh-boot run showed exactly this).
+    # `uread <max> <ms>` (PR #202) reads the pending buffer WITHOUT
+    # discarding — deterministic capture of whatever B sent.
+    ok, txt = con.cmd("uread 256 2000", "UART READ", 8)
+    pong = "504F4E47" in txt.upper()   # "PONG" in the hex
     bat.record("uart-read-pong", T, ok and pong,
-               f"PONG count={ (stream + txt).count('PONG') }" if pong else f"no PONG; stream={stream!r}", stream + txt)
+               f"PONG captured via uread ({txt[-80:]})" if pong
+               else f"no PONG; {txt[-160:]!r}", txt)
 
     ok, txt = con.cmd(f"write hex{{{HELLO_NL}}}", "UART Write:", 4)
-    con.send("read")
-    stream = con.drain(1.0)          # B echoes ECHO:HELLO x3 over 150ms
-    con.send("")
-    ok2, txt2 = con.wait("Stopped", 5)
-    echo = "ECHO:HELLO" in (stream + txt2)
+    ok2, txt2 = con.cmd("uread 256 1000", "UART READ", 8)
+    # ECHO:HELLO in hex: 45 43 48 4F 3A 48 45 4C 4C 4F
+    echo = "4543484F3A48454C4C4F" in txt2.upper()
     bat.record("uart-echo-hello", T, ok and ok2 and echo,
-               "A sent HELLO\\n, B echoed ECHO:HELLO" if echo else f"no echo; stream={stream!r}",
-               stream + txt2)
+               "A sent HELLO\\n, B echoed ECHO:HELLO (captured via uread)"
+               if echo else f"no echo; {txt2[-160:]!r}", txt2)
 
     ok, txt = con.cmd("ping", "Device detected", 12)
     bat.record("uart-ping-detect", T, ok,
@@ -463,6 +489,11 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     # clean mode boundary: A may still be mid-prompt after the I2C tier
     con.cmd("mode hiz", "HIZ>", 4)
     ok, txt = con.cmd("mode 1wire", "1WIRE>", 4)
+    # Fresh boot: mode entry walks the Data GPIO prompt — answer it if it
+    # appeared; the explicit 'config' step below re-applies deterministically.
+    if not ok and "Data GPIO" in txt:
+        con.send(str(DW_PIN))
+        ok, txt = con.wait("onfigured.", 15)
     bat.record("1wire-mode", T, ok, "", txt)
 
     con.send("config")
@@ -475,9 +506,21 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
     bat.record("1wire-ping", T, ok,
                "presence pulse from B" if ok else "no presence (add 4.7k pull-up?)", txt)
 
+    # A's `read` does ONE ROM+scratchpad cycle per attempt; if B's engine is
+    # mid stale-recovery when the cycle lands, the ROM reads as FF (B pulled
+    # presence but not the ROM bits) while A still reports "Complete" (its
+    # helpers return true on presence). Retry like 1wire-scan: B's 5 ms
+    # stale->IDLE recovery guarantees a clean next cycle.
     ok, txt = con.cmd("read", "OneWire Read: Complete.", 10)
     rom_ok = ROM_EXPECTED in txt
     spad_ok = "Scratchpad:" in txt
+    for _ in range(2):
+        if ok and rom_ok and spad_ok:
+            break
+        time.sleep(0.5)
+        ok, txt = con.cmd("read", "OneWire Read: Complete.", 10)
+        rom_ok = ROM_EXPECTED in txt
+        spad_ok = "Scratchpad:" in txt
     bat.record("1wire-read", T, ok and rom_ok and spad_ok,
                "ROM + scratchpad" if ok and rom_ok else f"ROM match={rom_ok}", txt)
 
@@ -841,30 +884,47 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     # --- Tier 6 (hiz pin release, firmware PR #204): B's GPIO mirror on
     # B10 (A4 wire, INPUT_PULLUP in mirror mode) witnesses A4's drive and
     # its release. Before the fix, 'mode' switches left A4 driving (DIO
-    # release was a no-op), so r3's "MIRROR in=1" never appeared.
+    # release was a no-op), so r3's new in=1 never appeared.
+    # Count-based waits: B can log the transition before the wait starts
+    # (B's pollMirror runs concurrently with A's console round-trips), so
+    # we compare regex-match counts before/after each action.
+    async def blog_count_up(rx: str, before: int, timeout: float = 8.0) -> bool:
+        pat = re.compile(rx)
+        end = time.time() + timeout
+        while time.time() < end:
+            if len(pat.findall(blog.snapshot())) > before:
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    n_g = len(re.findall(r"MODE=GPIO", blog.snapshot()))
     blog.write("GPIO")
-    fresh = blog.wait_new("MODE=GPIO", 6.0)
-    r1_ok = "MODE=GPIO" in fresh
+    r1_ok = await blog_count_up(r"MODE=GPIO", n_g, 10.0)
+    snap = blog.snapshot()
     bat.record("r1-mirror-arm", T, r1_ok,
                "B mirror armed (in=10 -> out=15); first poll logs in=1 "
                "(A4 INPUT after p8, B10 pull-up)" if r1_ok
-               else "no MODE=GPIO log: " + fresh[-120:], fresh[-300:])
+               else "no MODE=GPIO log: " + snap[-120:], snap[-300:])
+    await asyncio.sleep(0.5)  # let the arm-time in=1 poll settle
 
+    n0 = len(re.findall(r"MIRROR in=\s*0", blog.snapshot()))
     d = await mcp_call("set_pin", {"pin": 4, "level": False})
-    fresh = blog.wait_new("MIRROR in=0", 6.0)
-    r2_ok = ("error" not in d and "MIRROR in=0" in fresh)
+    r2_ok = ("error" not in d
+             and await blog_count_up(r"MIRROR in=\s*0", n0, 8.0))
+    snap = blog.snapshot()
     bat.record("r2-drive-low", T, r2_ok,
                "A4 drives LOW -> B10 mirror sees in=0" if r2_ok
-               else f"set={json.dumps(d)[:80]} log={fresh[-120:]}", fresh[-300:])
+               else f"set={json.dumps(d)[:80]}", snap[-300:])
 
+    n1 = len(re.findall(r"MIRROR in=\s*1", blog.snapshot()))
     d = await mcp_call("open_1wire", {"engagement_name": "battery-release-witness"})
     r3_sid = d.get("session_id")
-    fresh = blog.wait_new("MIRROR in=1", 8.0)
-    r3_ok = bool(r3_sid) and "MIRROR in=1" in fresh
+    r3_ok = bool(r3_sid) and await blog_count_up(r"MIRROR in=\s*1", n1, 8.0)
+    snap = blog.snapshot()
     bat.record("r3-mode-switch-releases-a4", T, r3_ok,
                "DIO->1wire switch released A4 -> B10 pull-up wins (in=1); "
                "old firmware: A4 kept driving LOW, no in=1" if r3_ok
-               else f"sid={r3_sid} log={fresh[-120:]}", fresh[-300:])
+               else f"sid={r3_sid}", snap[-300:])
 
     d = await mcp_call("close_1wire", {"session_id": r3_sid or "stub"})
     r4_ok = d.get("closed") is True
@@ -872,13 +932,14 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
                "witness 1-wire session closed (mode hiz also releases DQ)",
                json.dumps(d)[:200])
 
+    n_u = len(re.findall(r"MODE=UART \(pin15 restored", blog.snapshot()))
     blog.write("UART")
-    fresh = blog.wait_new("MODE=UART (pin15 restored", 6.0)
-    r5_ok = "MODE=UART (pin15 restored" in fresh
+    r5_ok = await blog_count_up(r"MODE=UART \(pin15 restored", n_u, 6.0)
     hw.release_pin(4)
+    snap = blog.snapshot()
     bat.record("r5-mirror-release", T, r5_ok,
                "B mirror released, u1 restored; A4 back to INPUT" if r5_ok
-               else "no MODE=UART log: " + fresh[-120:], fresh[-300:])
+               else "no MODE=UART log: " + snap[-120:], snap[-300:])
 
     # --- Tier 4 (I2C bidirectional + ping + servo).
     # A<->B I2C wires: A SDA=5->B8, SCL=6->B9. B's v1.17 IWRITE/IREAD make B
