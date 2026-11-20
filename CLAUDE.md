@@ -73,11 +73,14 @@ Three tiers enforced at the MCP server boundary (safety.py):
 
 - **read-only**: list_devices, verify_connection, scan_baud, read_output,
   spi_probe, spi_read, spi_dump, spi_transfer, spi_flash_analyze,
-  spi_flash_search, spi_flash_strings, i2c_scan, i2c_read, i2c_dump,
-  onewire_search, onewire_read
+  spi_flash_search, spi_flash_strings, i2c_scan, i2c_read, i2c_dump, i2c_ping,
+  onewire_search, onewire_read, onewire_ping, onewire_temp,
+  measure_pin, measure_frequency, capture, read_pin
 - **allowed-write**: open_uart, send_command, close_uart, enter_download_mode,
   read_flash, open_spi, close_spi, spi_config, open_i2c, close_i2c,
-  open_1wire, close_1wire
+  open_i2c_slave, close_i2c_slave, i2c_slave_log, open_1wire, close_1wire,
+  onewire_write_spad, set_pin, pulse, pull_up, pull_down, pwm_set, pwm_stop,
+  servo_set
 - **approval-write**: set_voltage, set_power, spi_write, i2c_write,
   spi_flash_erase - require literal `_confirmed: true` AND the firmware's own
   confirmation prompt is driven. Do not bypass or weaken either gate.
@@ -103,9 +106,10 @@ Three tiers enforced at the MCP server boundary (safety.py):
 python3 -m venv .venv            # or: uv venv --python 3.11 .venv
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m buspirate_mcp          # stdio server (spawned by MCP client)
-.venv/bin/python -m pytest                 # 221 tests, no hardware needed
+.venv/bin/python -m pytest                 # 287 tests, no hardware needed
 .venv/bin/python scripts/smoke_live.py     # live DIO smoke test (board attached)
 .venv/bin/python scripts/smoke_live_spi.py # live SPI shell smoke test (read-only)
+.venv/bin/python scripts/protocol_battery.py # 92-step end-to-end battery (2-board rig)
 ```
 
 ## Style
