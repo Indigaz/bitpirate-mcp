@@ -297,10 +297,10 @@ def run_console_tier(bat: Battery, con: Console, blog: BLog) -> None:
             con.send(f"set {pin} {lvl}")
             time.sleep(0.25)
             con.drain(0.02)
-    # A's 'hiz' does not actually release DIO pins (upstream quirk:
-    # disableAllProtocols() is empty) — the last audit level on pin 9
-    # would hold B's 1-Wire DQ LOW for the rest of the run and B's DW
-    # state machine would flood the log buffer (runs 4-6). End DQ HIGH.
+    # A's 'hiz' releases DIO pins for real since PR #204 (verified by
+    # r1-r5 in the MCP tier). The 'set 9 H' before 'mode hiz' is kept as
+    # belt-and-braces: it guarantees DQ goes HIGH before release either
+    # way (B's DQ pull-up also holds the line).
     con.send("set 9 H")
     time.sleep(0.1)
     con.drain(0.05)
@@ -837,6 +837,48 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
     bat.record("p8-pwm-stop", T, p8_ok,
                f"A PWM stopped: pin {d.get('pin')} reset to INPUT", json.dumps(d)[:200])
     hw.release_pin(4)
+
+    # --- Tier 6 (hiz pin release, firmware PR #204): B's GPIO mirror on
+    # B10 (A4 wire, INPUT_PULLUP in mirror mode) witnesses A4's drive and
+    # its release. Before the fix, 'mode' switches left A4 driving (DIO
+    # release was a no-op), so r3's "MIRROR in=1" never appeared.
+    blog.write("GPIO")
+    fresh = blog.wait_new("MODE=GPIO", 6.0)
+    r1_ok = "MODE=GPIO" in fresh
+    bat.record("r1-mirror-arm", T, r1_ok,
+               "B mirror armed (in=10 -> out=15); first poll logs in=1 "
+               "(A4 INPUT after p8, B10 pull-up)" if r1_ok
+               else "no MODE=GPIO log: " + fresh[-120:], fresh[-300:])
+
+    d = await mcp_call("set_pin", {"pin": 4, "level": False})
+    fresh = blog.wait_new("MIRROR in=0", 6.0)
+    r2_ok = ("error" not in d and "MIRROR in=0" in fresh)
+    bat.record("r2-drive-low", T, r2_ok,
+               "A4 drives LOW -> B10 mirror sees in=0" if r2_ok
+               else f"set={json.dumps(d)[:80]} log={fresh[-120:]}", fresh[-300:])
+
+    d = await mcp_call("open_1wire", {"engagement_name": "battery-release-witness"})
+    r3_sid = d.get("session_id")
+    fresh = blog.wait_new("MIRROR in=1", 8.0)
+    r3_ok = bool(r3_sid) and "MIRROR in=1" in fresh
+    bat.record("r3-mode-switch-releases-a4", T, r3_ok,
+               "DIO->1wire switch released A4 -> B10 pull-up wins (in=1); "
+               "old firmware: A4 kept driving LOW, no in=1" if r3_ok
+               else f"sid={r3_sid} log={fresh[-120:]}", fresh[-300:])
+
+    d = await mcp_call("close_1wire", {"session_id": r3_sid or "stub"})
+    r4_ok = d.get("closed") is True
+    bat.record("r4-close-witness-session", T, r4_ok,
+               "witness 1-wire session closed (mode hiz also releases DQ)",
+               json.dumps(d)[:200])
+
+    blog.write("UART")
+    fresh = blog.wait_new("MODE=UART (pin15 restored", 6.0)
+    r5_ok = "MODE=UART (pin15 restored" in fresh
+    hw.release_pin(4)
+    bat.record("r5-mirror-release", T, r5_ok,
+               "B mirror released, u1 restored; A4 back to INPUT" if r5_ok
+               else "no MODE=UART log: " + fresh[-120:], fresh[-300:])
 
     # --- Tier 4 (I2C bidirectional + ping + servo).
     # A<->B I2C wires: A SDA=5->B8, SCL=6->B9. B's v1.17 IWRITE/IREAD make B
