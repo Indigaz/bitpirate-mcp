@@ -996,6 +996,51 @@ async def tool_pwm_stop(
     return hardware.pwm_stop(pin)
 
 
+async def tool_servo_set(
+    hardware: Any,
+    pin: int,
+    angle: int,
+) -> dict[str, Any]:
+    """Drive a servo on a GPIO pin: 50 Hz PWM, angle 0-180 (1-2 ms pulse).
+
+    Stop with the pwm_stop tool (firmware `reset <pin>`)."""
+    return hardware.servo(pin, angle)
+
+
+async def tool_i2c_ping(
+    hardware: Any,
+    addr: int,
+) -> dict[str, Any]:
+    """Ping a 7-bit I2C address (single ACK/NACK probe)."""
+    return hardware.i2c_ping(addr)
+
+
+async def tool_open_i2c_slave(
+    hardware: Any,
+    addr: int,
+) -> dict[str, Any]:
+    """Put A into I2C SLAVE mode at a 7-bit address (firmware `slave <addr>`).
+
+    A blocks in a slave loop until close_i2c_slave(); no other A commands may
+    run while it is active. The master side (e.g. rig-responder B `IWRITE`/
+    `IREAD`) drives the bus."""
+    return hardware.open_i2c_slave(addr)
+
+
+async def tool_i2c_slave_log(
+    hardware: Any,
+) -> dict[str, Any]:
+    """Snapshot A's I2C slave traffic log while the slave session is active."""
+    return hardware.i2c_slave_log()
+
+
+async def tool_close_i2c_slave(
+    hardware: Any,
+) -> dict[str, Any]:
+    """Exit A's I2C slave mode (ENTER) and return the buffered slave log."""
+    return hardware.close_i2c_slave()
+
+
 # ---------------------------------------------------------------------------
 # SPI tools (ESP32-Bit-Pirate: native flash shell + instruction syntax)
 # ---------------------------------------------------------------------------

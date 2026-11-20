@@ -77,6 +77,23 @@ RE_DIO_PULLUP: re.Pattern = re.compile(rb"DIO Pullup: Set on GPIO (\d+)")
 RE_DIO_PULLDOWN: re.Pattern = re.compile(rb"DIO Pulldown: Set on GPIO (\d+)")
 RE_DIO_PWM: re.Pattern = re.compile(rb"DIO PWM: GPIO (\d+) \((\d+)Hz, (\d+)% duty\)")
 RE_DIO_RESET: re.Pattern = re.compile(rb"DIO Reset: GPIO (\d+) to INPUT")
+RE_DIO_SERVO: re.Pattern = re.compile(rb"DIO Servo: Set GPIO (\d+) to angle (\d+)")
+# --- Tier 4: I2C bidirectional (ping + slave) ---
+RE_I2C_PING: re.Pattern = re.compile(rb"Ping 0x([0-9A-F]{2}): I2C Ping: (ACK received|No response)")
+RE_I2C_SLAVE_LISTEN: re.Pattern = re.compile(rb"I2C Slave: Listening on address 0x([0-9A-F]{2})")
+RE_I2C_SLAVE_STOP: re.Pattern = re.compile(rb"I2C Slave: Stopped by user")
+RE_I2C_SLAVE_WROTE: re.Pattern = re.compile(rb"Master wrote: 0x((?: [0-9A-F]{2})+)")
+RE_I2C_SLAVE_REQ: re.Pattern = re.compile(rb"Master requested read")
+
+
+def _parse_slave_log(t: bytes) -> list[str]:
+    """Extract A's I2C slave-log entries from a console capture."""
+    entries: list[str] = []
+    for m in RE_I2C_SLAVE_WROTE.finditer(t):
+        entries.append("Master wrote: 0x" + m.group(1).decode())
+    for _m in RE_I2C_SLAVE_REQ.finditer(t):
+        entries.append("Master requested read")
+    return entries
 
 # -- SPI flash (v1.8 source: SpiFlashShell.cpp, UserInputManager.cpp) --
 SPI_MENU_MARK = b"=== SPI Flash Shell ==="
@@ -145,6 +162,9 @@ class BitPirateHardware:
         self.serial: serial.Serial | None = None
         self._active_mode: str | None = None
         self._flash_shell_open: bool = False
+        # Tier 4: A-side I2C slave session (firmware `slave <addr>` loop).
+        self._slave_active: bool = False
+        self._slave_addr: int = 0
         self._last_voltage_mv: int = 0
         self._last_current_ma: int = 0
         # Protocol pins/speeds (XIAO env / current rig wiring defaults).
@@ -380,6 +400,90 @@ class BitPirateHardware:
                 f"Cannot parse pwm_stop result for pin {pin}", t.decode("utf-8", "replace")
             )
         return {"pin": int(m.group(1))}
+
+    def servo(self, pin: int, angle: int) -> dict:
+        """+  DIO servo: 50 Hz servo PWM (angle 0-180 -> 1-2 ms pulse).
+        Stop with pwm_stop() (firmware `reset <pin>`)."""
+        self._validate_pin(pin)
+        a = int(angle)
+        if not 0 <= a <= 180:
+            raise ValueError(f"angle must be 0-180, got: {angle!r}")
+        t = self._dio("servo", str(pin), str(a))
+        m = RE_DIO_SERVO.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse servo result for pin {pin}", t.decode("utf-8", "replace")
+            )
+        return {"pin": int(m.group(1)), "angle": int(m.group(2))}
+
+    def i2c_ping(self, addr: int) -> dict:
+        """Ping a 7-bit I2C address (single ACK/NACK probe, read-only)."""
+        if not isinstance(addr, int) or isinstance(addr, bool) or not 0x08 <= addr <= 0x77:
+            raise ValueError(f"addr must be 0x08-0x77, got: {addr!r}")
+        self._ensure_i2c()
+        t = self._cmd(f"ping 0x{addr:02X}")
+        m = RE_I2C_PING.search(t)
+        if not m:
+            raise BitPirateCLIError(
+                f"Cannot parse ping result for 0x{addr:02X}", t.decode("utf-8", "replace")
+            )
+        return {"addr": addr, "ack": m.group(2) == b"ACK received"}
+
+    def open_i2c_slave(self, addr: int) -> dict:
+        """Enter A-side I2C slave mode at 7-bit `addr` (firmware `slave <addr>`).
+
+        The firmware blocks in a slave loop until ENTER, so this does NOT
+        use _cmd(): it sends the command, waits for the 'Listening' line,
+        and marks the session active. Use close_i2c_slave() to exit (it
+        returns the buffered slave log). No other A commands may run while
+        the slave loop is active.
+        """
+        if not isinstance(addr, int) or isinstance(addr, bool) or not 0x08 <= addr <= 0x77:
+            raise ValueError(f"addr must be 0x08-0x77, got: {addr!r}")
+        if self._slave_active:
+            raise BitPirateCLIError("I2C slave already active")
+        self._ensure_i2c()
+        self._send_line(f"slave 0x{addr:02X}")
+        t = self._wait_text(b"I2C Slave: Listening", 5.0)
+        if not RE_I2C_SLAVE_LISTEN.search(t):
+            raise BitPirateCLIError(
+                "Cannot parse slave listen line", t.decode("utf-8", "replace")
+            )
+        self._slave_active = True
+        self._slave_addr = addr
+        return {"addr": addr}
+
+    def i2c_slave_log(self) -> dict:
+        """Snapshot A's I2C slave log while the slave session is active.
+
+        Sends a probe char (A echoes it) and returns the slave-loop output
+        captured in the window (log lines appear on the console as they
+        happen; nothing else is sent to A).
+        """
+        if not self._slave_active:
+            raise BitPirateCLIError("No I2C slave session active")
+        s = self._require_serial()
+        s.write(b" ")
+        t = self._read_until_prompt(2.0)
+        return {"entries": _parse_slave_log(t)}
+
+    def close_i2c_slave(self) -> dict:
+        """Exit A's I2C slave mode (ENTER) and return the buffered slave log."""
+        if not self._slave_active:
+            raise BitPirateCLIError("No I2C slave session active")
+        s = self._require_serial()
+        s.write(b"\r")
+        t = self._read_until_prompt(5.0)
+        if not RE_I2C_SLAVE_STOP.search(t):
+            raise BitPirateCLIError(
+                "Slave loop did not stop (no 'Stopped by user')",
+                t.decode("utf-8", "replace"),
+            )
+        entries = _parse_slave_log(t)
+        addr = self._slave_addr
+        self._slave_active = False
+        self._slave_addr = 0
+        return {"addr": addr, "entries": entries}
 
     def measure_pin(self, pin: int, duration_ms: int = 2000) -> dict:
         """+  DIO measure: edge counter + approximate frequency (signal

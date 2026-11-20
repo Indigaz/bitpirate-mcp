@@ -66,6 +66,12 @@ _TOOL_TIERS: dict[str, SafetyTier] = {
     "pull_down": SafetyTier.ALLOWED_WRITE,
     "pwm_set": SafetyTier.ALLOWED_WRITE,
     "pwm_stop": SafetyTier.ALLOWED_WRITE,
+    # I2C bidirectional + servo (Tier 4)
+    "servo_set": SafetyTier.ALLOWED_WRITE,
+    "i2c_ping": SafetyTier.READ_ONLY,
+    "open_i2c_slave": SafetyTier.ALLOWED_WRITE,
+    "i2c_slave_log": SafetyTier.READ_ONLY,
+    "close_i2c_slave": SafetyTier.ALLOWED_WRITE,
     # Logic Analyzer (FALA)
     # (Logic analyzer tools removed -- no FALA on the ESP32-Bit-Pirate)
 }

@@ -823,6 +823,68 @@ TOOL_DEFINITIONS = [
             "required": ["pin"],
         },
     ),
+    Tool(
+        name="servo_set",
+        description=(
+            "Drive an RC servo on a GPIO pin: 50 Hz PWM, angle 0-180 maps to a "
+            "1-2 ms pulse. Stop with pwm_stop. [write] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "pin": {"type": "integer", "description": "ESP32 GPIO (0-48)"},
+                "angle": {"type": "integer", "description": "Servo angle (0-180)"},
+            },
+            "required": ["pin", "angle"],
+        },
+    ),
+    Tool(
+        name="i2c_ping",
+        description=(
+            "Ping a 7-bit I2C address with a single probe transaction; reports "
+            "ACK (device present) or NACK (no response). "
+            "[read-only] [Duration: fast.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "addr": {"type": "integer", "description": "7-bit I2C address (8-119)"},
+            },
+            "required": ["addr"],
+        },
+    ),
+    Tool(
+        name="open_i2c_slave",
+        description=(
+            "Put A into I2C SLAVE mode at a 7-bit address: it ACKs and logs "
+            "master traffic on the shared SDA/SCL until close_i2c_slave. No "
+            "other A commands run while active. [write] [Duration: fast to arm; "
+            "session lasts until close.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "addr": {"type": "integer", "description": "7-bit I2C address (8-119)"},
+            },
+            "required": ["addr"],
+        },
+    ),
+    Tool(
+        name="i2c_slave_log",
+        description=(
+            "Snapshot A's I2C slave traffic log (master writes + read requests) "
+            "while the slave session is active. [read-only] [Duration: ~2 s.]"
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
+    Tool(
+        name="close_i2c_slave",
+        description=(
+            "Exit A's I2C slave mode and return the buffered slave traffic log. "
+            "[write] [Duration: fast.]"
+        ),
+        inputSchema={"type": "object", "properties": {}, "required": []},
+    ),
 ]
 
 
@@ -1178,6 +1240,37 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 hardware=hw,
                 pin=arguments["pin"],
             )
+
+        # --- Tier 4: I2C bidirectional + servo ---
+        elif name == "servo_set":
+            hw = _get_hardware()
+            result = await tools.tool_servo_set(
+                hardware=hw,
+                pin=arguments["pin"],
+                angle=arguments["angle"],
+            )
+
+        elif name == "i2c_ping":
+            hw = _get_hardware()
+            result = await tools.tool_i2c_ping(
+                hardware=hw,
+                addr=arguments["addr"],
+            )
+
+        elif name == "open_i2c_slave":
+            hw = _get_hardware()
+            result = await tools.tool_open_i2c_slave(
+                hardware=hw,
+                addr=arguments["addr"],
+            )
+
+        elif name == "i2c_slave_log":
+            hw = _get_hardware()
+            result = await tools.tool_i2c_slave_log(hardware=hw)
+
+        elif name == "close_i2c_slave":
+            hw = _get_hardware()
+            result = await tools.tool_close_i2c_slave(hardware=hw)
 
         # --- 1-Wire ---
         elif name == "open_1wire":

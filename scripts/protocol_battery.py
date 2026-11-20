@@ -838,6 +838,76 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
                f"A PWM stopped: pin {d.get('pin')} reset to INPUT", json.dumps(d)[:200])
     hw.release_pin(4)
 
+    # --- Tier 4 (I2C bidirectional + ping + servo).
+    # A<->B I2C wires: A SDA=5->B8, SCL=6->B9. B's v1.17 IWRITE/IREAD make B
+    # the master (temporarily re-ending its 0x50 slave); A-as-slave is driven
+    # and logs the traffic. Servo uses A4->B10 (B MEASURE counts the 50 Hz).
+    d = await mcp_call("i2c_ping", {"addr": 0x50})
+    s1_ok = (d.get("ack") is True)
+    bat.record("s1-i2c-ping-b", T, s1_ok,
+               f"A ping 0x50 (B slave) -> ack={d.get('ack')} (expect True)", json.dumps(d)[:200])
+
+    d = await mcp_call("i2c_ping", {"addr": 0x21})
+    s2_ok = (d.get("ack") is False)
+    bat.record("s2-i2c-ping-empty", T, s2_ok,
+               f"A ping 0x21 (empty) -> ack={d.get('ack')} (expect False)", json.dumps(d)[:200])
+
+    d = await mcp_call("open_i2c_slave", {"addr": 0x60})
+    s3_ok = (d.get("addr") == 0x60)
+    bat.record("s3-open-i2c-slave", T, s3_ok,
+               f"A I2C slave armed at 0x60 (A blocks until close)", json.dumps(d)[:200])
+
+    blog.write("IWRITE 0x60 0x01 0xA5 0xB6")
+    iw = blog.wait_new("IWRITE 0x60:", 6.0)
+    s4_ok = ("IWRITE 0x60: 3 bytes ACK" in iw)
+    bat.record("s4-b-i2c-write-a", T, s4_ok,
+               f"B IWRITE 0x60 <- 01 A5 B6 -> {iw.strip()[-40:]}", iw.strip()[-200:])
+
+    blog.write("IREAD 0x60 4")
+    ir = blog.wait_new("IREAD 0x60:", 6.0)
+    s5_ok = ("IREAD 0x60:" in ir)
+    bat.record("s5-b-i2c-read-a", T, s5_ok,
+               f"B IREAD 0x60 (4) -> {ir.strip()[-40:]} (A slave saw the read request; "
+               f"ESP32 slave sends residual bytes on empty request)", ir.strip()[-200:])
+
+    d = await mcp_call("i2c_slave_log", {})
+    entries = d.get("entries", [])
+    s6_ok = any("Master wrote: 0x 01 A5 B6" in e for e in entries) and \
+            any("Master requested read" in e for e in entries)
+    bat.record("s6-a-slave-log", T, s6_ok,
+               f"A slave log (mid-session): {entries}", json.dumps(entries)[:300])
+
+    d = await mcp_call("close_i2c_slave", {})
+    # s6 already consumed the buffered log lines (streaming console); the close
+    # must exit the firmware slave loop cleanly (no exception) and return addr.
+    s7_ok = (isinstance(d, dict) and d.get("addr") == 0x60 and "error" not in d)
+    bat.record("s7-close-i2c-slave", T, s7_ok,
+               f"A slave stopped cleanly; close returned {d.get('addr')}", json.dumps(d)[:300])
+
+    d = await mcp_call("servo_set", {"pin": 4, "angle": 90})
+    s8_ok = (d.get("pin") == 4 and d.get("angle") == 90)
+    bat.record("s8-servo-arm", T, s8_ok,
+               f"A servo on 4 -> B10: 50 Hz, angle {d.get('angle')} (1.5 ms pulse)", json.dumps(d)[:200])
+
+    blog.write("MEASURE 10 2000")
+    fresh = blog.wait_new("MEASURE pin=", 6.0)
+    mp = re.search(
+        r"MEASURE pin=(\d+) rising=(\d+) falling=(\d+) freq=(\d+)Hz duty=([\d.]+)%",
+        fresh)
+    bfreq = int(mp.group(4)) if mp else 0
+    brise = int(mp.group(2)) if mp else 0
+    bduty = float(mp.group(5)) if mp else -1.0
+    s9_ok = (40 <= bfreq <= 60 and brise >= 80 and 4 <= bduty <= 11)
+    bat.record("s9-servo-measure", T, s9_ok,
+               f"B MEASURE: {fresh.strip()[-90:]}" if fresh.strip()
+               else "B MEASURE: (no output)", fresh.strip()[-200:])
+
+    d = await mcp_call("pwm_stop", {"pin": 4})
+    s10_ok = (d.get("pin") == 4)
+    bat.record("s10-servo-stop", T, s10_ok,
+               f"A servo stopped: pin {d.get('pin')} reset to INPUT", json.dumps(d)[:200])
+    hw.release_pin(4)
+
 
 def main() -> int:
     bat = Battery()

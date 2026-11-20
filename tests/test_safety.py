@@ -13,7 +13,7 @@ class TestClassifyTool:
             "i2c_scan", "i2c_read", "i2c_dump",
             "onewire_search", "onewire_read",
             "measure_pin", "measure_frequency", "capture",
-            "read_pin",
+            "read_pin", "i2c_ping", "i2c_slave_log",
         ]:
             assert classify_tool(tool) == SafetyTier.READ_ONLY
 
@@ -25,6 +25,7 @@ class TestClassifyTool:
             "open_i2c", "close_i2c",
             "open_1wire", "close_1wire",
             "set_pin", "pulse", "pull_up", "pull_down", "pwm_set", "pwm_stop",
+            "servo_set", "open_i2c_slave", "close_i2c_slave",
         ]:
             assert classify_tool(tool) == SafetyTier.ALLOWED_WRITE
 
