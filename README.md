@@ -1,12 +1,15 @@
-# bitpirate-mcp
+<p align="center">
+  <img src="assets/banner.png" alt="Bit Pirate MCP — agent-driven multibus bench for the ESP32-Bit-Pirate" width="1200">
+</p>
 
 An [MCP](https://modelcontextprotocol.io/) server for the
 [ESP32-Bit-Pirate](https://github.com/geo-tp/ESP32-Bit-Pirate) - an open-source,
 ESP32-S3-based clone of the Bus Pirate multibus tool. It exposes the bench's
-UART, SPI (incl. the on-device flash shell), I2C, 1-Wire and GPIO capabilities
-as MCP tools over stdio, so an AI agent can probe, dump and analyze firmware on
-a target board end-to-end: attach a device to the ESP32, let the agent drive
-the tools, and get extracted binaries and analysis out the other end.
+UART, SPI (incl. the on-device flash shell), I2C (master **and** slave),
+1-Wire, GPIO, PWM and scope/measure capabilities as MCP tools over stdio, so
+an AI agent can probe, dump and analyze firmware on a target board end-to-end:
+attach a device to the ESP32, let the agent drive the tools, and get extracted
+binaries and analysis out the other end.
 
 A port of [buspirate-mcp](https://github.com/mplogas/buspirate-mcp)
 (Marc Plogas, MIT) from the BusPirate 6's BPIO2 binary protocol to the
@@ -23,7 +26,7 @@ Bit-Pirate v1.8 firmware source.
 | Flash work | Manual JEDEC sequences + host-side page program/erase | **Native firmware flash shell**: probe, on-device analysis, search, strings, read, raw dump, patch write, full erase |
 | On-device analysis | None | `BinaryAnalyzer` in firmware: file signatures, secret patterns (keys/hashes/URLs), entropy summary |
 | Raw transactions | `spi_transfer` byte arrays | BP6-style instruction syntax `[0x9F r:3]` dispatched by the firmware |
-| Logic analyzer | FALA (5 tools, 75 MHz, 8 ch) | Removed - no FALA; `verify_connection` uses the DIO `measure` edge/frequency detector |
+| Logic analyzer | FALA (5 tools, 75 MHz, 8 ch) | Removed - no FALA; `verify_connection` uses the DIO `measure` edge/frequency detector; `measure_pin`/`measure_frequency`/`capture` cover DIO timing |
 | Power supply | Hardware PSU (3 tools) | None on the bare devkit - tools report `psu: unavailable` gracefully |
 | Signal timing | Fast binary protocol | ~2 s per menu round-trip (firmware main-loop latency); raw dump is serial-bottlenecked (~11.5 KB/s) |
 
@@ -41,7 +44,7 @@ MCP client (Claude Code, Hermes, any MCP host)
 server.py            tool definitions + dispatch + safety tiers + session mgmt
   |
   v
-tools.py             33 tool implementations (protocol-agnostic where possible)
+tools.py             51 tool implementations (protocol-agnostic where possible)
   |
   v
 bitpirate_hardware.py  THE device layer (the only firmware-specific module)
@@ -68,34 +71,76 @@ Every command string in the driver was taken from the v1.8 firmware source -
 `SpiFlashShell.cpp`, `SpiController.cpp`, `DioController.cpp`,
 `UserInputManager.cpp`, `ActionDispatcher.cpp` - not assumed.
 
-## Tools (33)
+## Tools (51)
 
+Safety tiers: **read-only** (full autonomy), **allowed-write** (autonomous,
+logged), **approval-write** (blocks until a human confirms with
+`_confirmed: true` *and* the firmware's own confirmation prompts are driven -
+double-gated for destructive operations).
+
+### Session & UART
 | Tool | Tier | Notes |
 |---|---|---|
 | `list_devices` | read-only | USB CDC console ports |
 | `verify_connection` | read-only | DIO `measure` edge/frequency detector on TX/RX |
 | `scan_baud` | read-only | baud probing over a UART session |
-| `open_uart` / `read_output` / `send_command` / `close_uart` | allowed / read | console interaction with targets |
-| `set_voltage` / `set_power` | approval | report `psu: unavailable` (no PSU on this board) |
-| `enter_download_mode` | allowed | boot/EN pin toggling (0-48 GPIO) |
-| `read_flash` | allowed | esptool through the firmware UART **bridge** (Phase 4) |
-| `open_spi` / `close_spi` | allowed | mode switch + engagement session; close exits the flash shell |
-| `spi_probe` | read-only | firmware flash probe: JEDEC ID, manufacturer, model, capacity, capability notes |
-| `spi_read` | read-only | region read as hexdump (flash shell menu 5) |
-| `spi_dump` | read-only | **raw full-chip dump to a file** (menu 8) - the workhorse for RE |
-| `spi_write` | **approval** | patch write from file/hex/ASCII (menu 6), auto-erase option |
-| `spi_flash_erase` | **approval** | full-chip erase (menu 9) - destructive |
+| `open_uart` / `send_command` / `close_uart` | allowed-write | console interaction with targets |
+| `read_output` | read-only | non-blocking capture of target output |
+| `enter_download_mode` | allowed-write | boot/EN pin toggling (0-48 GPIO) |
+| `read_flash` | allowed-write | esptool through the firmware UART **bridge** |
+
+### SPI (incl. on-device flash shell)
+| Tool | Tier | Notes |
+|---|---|---|
+| `open_spi` / `close_spi` | allowed-write | mode switch + engagement session; close exits the flash shell |
+| `spi_probe` | read-only | firmware flash probe: JEDEC ID, manufacturer, model, capacity |
+| `spi_read` | read-only | region read as hexdump |
+| `spi_dump` | read-only | **raw full-chip dump to a file** - the workhorse for RE |
+| `spi_write` | **approval-write** | patch write from file/hex/ASCII, auto-erase option |
 | `spi_transfer` | read-only | BP6-style instruction `[0x9F r:3]` (JEDEC, status, custom sequences) |
-| `spi_config` | allowed | MOSI/MISO/SCLK/CS pins + 1-80 MHz + WP/HOLD (NVS-persisted) |
+| `spi_config` | allowed-write | MOSI/MISO/SCLK/CS pins + 1-80 MHz + WP/HOLD (NVS-persisted) |
 | `spi_flash_analyze` | read-only | on-device BinaryAnalyzer: file signatures, secrets, entropy |
 | `spi_flash_search` | read-only | string search (1-32 bytes) with context |
 | `spi_flash_strings` | read-only | printable-string extraction |
-| `open_i2c` / `i2c_scan` / `i2c_read` / `i2c_write` / `i2c_dump` / `close_i2c` | mixed | I2C bus (host-driven; firmware session work pending) |
-| `open_1wire` / `onewire_search` / `onewire_read` / `close_1wire` | mixed | 1-Wire bus |
+| `spi_flash_erase` | **approval-write** | full-chip erase - destructive |
 
-Approval-tier tools require an explicit `_confirmed: true` **and** the
-firmware's own confirmation prompts are driven - double-gated for destructive
-operations.
+### I2C (master + slave)
+| Tool | Tier | Notes |
+|---|---|---|
+| `open_i2c` / `close_i2c` | allowed-write | engagement session |
+| `i2c_ping` | read-only | single-byte ping (ack/no-ack) |
+| `i2c_scan` | read-only | bus scan |
+| `i2c_read` / `i2c_dump` | read-only | register read / range dump |
+| `i2c_write` | **approval-write** | register write |
+| `open_i2c_slave` / `close_i2c_slave` | allowed-write | bench as **I2C slave**: a target master can write to / read from the bench |
+| `i2c_slave_log` | read-only | mid-session capture of what a target master sent |
+
+### 1-Wire (incl. DS18B20 lifecycle)
+| Tool | Tier | Notes |
+|---|---|---|
+| `open_1wire` / `close_1wire` | allowed-write | engagement session |
+| `onewire_search` | read-only | ROM search (multi-device aware) |
+| `onewire_ping` | read-only | presence detect |
+| `onewire_temp` | read-only | DS18B20 convert + read (CRC-checked by firmware) |
+| `onewire_read` | read-only | scratchpad read-back |
+| `onewire_write_spad` | allowed-write | scratchpad program (e.g. temperature-set for test emulators) |
+
+### DIO, PWM & measurement
+| Tool | Tier | Notes |
+|---|---|---|
+| `set_pin` / `read_pin` | allowed / read | GPIO drive and sample |
+| `pulse` | allowed-write | timed pulse on a pin |
+| `pull_up` / `pull_down` | allowed-write | weak-pull configuration |
+| `pwm_set` / `pwm_stop` | allowed-write | hardware PWM (50 Hz-~100 kHz) |
+| `servo_set` | allowed-write | 50 Hz pulse-width servo control |
+| `measure_pin` | read-only | edge/level timing on a pin |
+| `measure_frequency` | read-only | frequency measurement |
+| `capture` | read-only | bounded logic capture (hex) |
+
+### PSU (hardware-dependent)
+| Tool | Tier | Notes |
+|---|---|---|
+| `set_voltage` / `set_power` | **approval-write** | report `psu: unavailable` (no PSU on the bare devkit) |
 
 ## Install
 
@@ -138,7 +183,7 @@ needed for first use - the firmware keeps its SPI pin map in NVS
 
 ## Testing & verification
 
-- **221 tests**, all passing. The device layer is tested with a
+- **287 unit tests**, all passing. The device layer is tested with a
   **transcript-driven protocol mock** (`FakeSerial`): scripted firmware
   transcripts are released only after the triggering command is written,
   simulating real round-trip latency so command/response pairing cannot bleed
@@ -146,22 +191,73 @@ needed for first use - the firmware keeps its SPI pin map in NVS
   (e.g. `y`/`y`) resolve in firmware order, and it accepts raw bytes for the
   dump path.
 - **Live-verified on hardware** (ESP32-S3 devkit + Bit-Pirate v1.8, no target
-  attached - no-chip paths):
-  - DIO: read, edge counter, and electrical drive-HIGH/LOW self-test
-  - instruction syntax: `[0x9F r:3]` → `00 00 00` (floating bus, correct)
-  - flash shell: probe (no-chip detection), analyze short-circuit, clean shell exit
-- Reproduce the live smoke tests: `scripts/smoke_live.py`,
-  `scripts/smoke_live_spi.py` (read-only by design).
+  attached - no-chip paths): DIO read, edge counter, drive-HIGH/LOW
+  self-test; instruction syntax `[0x9F r:3]` (floating bus, correct);
+  flash shell probe (no-chip detection), analyze short-circuit, clean shell
+  exit. Reproduce: `scripts/smoke_live.py`, `scripts/smoke_live_spi.py`
+  (read-only by design).
+- **Protocol battery: 92/92 steps green** on a two-board rig. A second
+  ESP32-S3 running a custom `rig-responder` firmware acts as the target side
+  (SPI slave, I2C slave + master, 1-Wire DS18B20 emulator with
+  scratchpad/RAM, GPIO mirror witness, scope). Every checked value is derived
+  from a known write - no flake-tolerant assertions. `scripts/protocol_battery.py`
+  (console 31 steps + mcp 61 steps).
 
 ## Roadmap
 
-- **Phase 3** - I2C/1-Wire sessions rewritten against the firmware's native
-  controllers (scan/read/write/dump + I2C monitor/glitch when grounded);
-  SPI **EEPROM shell** (24cxx/25xxx - matches common bench EEPROMs).
-- **Phase 4** - `read_flash` via the firmware UART bridge + esptool
-  (transparent bridge is persistent; requires a button/USB-replug to exit).
-- **Phase 5** - packaging: rename the `buspirate_mcp` package to
-  `bitpirate_mcp`, PyPI publish, CI.
+### Shipped
+
+| Phase / Tier | What landed |
+|---|---|
+| Phase 1–2 | Console driver (prompt/marker-aware), safety tiers, UART session tools |
+| Phase 3 | I2C host tools + 1-Wire search/read |
+| Phase 4 | `read_flash` via the firmware UART bridge (esptool) |
+| Phase 5 | Scope/measure: `measure_pin`, `measure_frequency`, `capture` |
+| Tier 3 | DIO digital + PWM: `set_pin`, `read_pin`, `pulse`, `pull_up`, `pull_down`, `pwm_set`, `pwm_stop` |
+| Tier 4 | Bidirectional I2C (ping + bench-as-slave) + `servo_set` |
+| Tier 5 | 1-Wire DS18B20 lifecycle: `onewire_ping`, `onewire_temp`, `onewire_write_spad` |
+| Tier 6 | Deterministic end-to-end verification: the 92-step protocol battery on a real two-board rig |
+
+### Open upstream PRs (geo-tp/ESP32-Bit-Pirate)
+
+| PR | Fix |
+|---|---|
+| [#201](https://github.com/geo-tp/ESP32-Bit-Pirate/pull/201) | onewire: add `xfer` command (raw 1-Wire transfer primitive) |
+| [#202](https://github.com/geo-tp/ESP32-Bit-Pirate/pull/202) | uart: add `uread` bounded read; stop redundant UART re-init |
+| [#203](https://github.com/geo-tp/ESP32-Bit-Pirate/pull/203) | scope/measure: bounded `wizreport`, `freqms`, `logiccap` commands for the MCP driver |
+| [#204](https://github.com/geo-tp/ESP32-Bit-Pirate/pull/204) | hiz: actually release DIO/OneWire/UART pins on mode exit |
+
+### Next (MCP-side, small)
+
+- `dio_toggle` - invert a pin without re-driving a level.
+- `uart_ping` - timed (5 s) capture to characterize a DUT's baud/echo behavior.
+- `i2c_transfer` - bracket instruction syntax for raw I2C sequences
+  (parity with `spi_transfer`).
+
+### Proposed features (by effort)
+
+- **XMODEM send/receive tools** - the firmware already implements xmodem;
+  expose it as MCP tools for AT-style DUT firmware flashing.
+- **`uart_read_lines`** - line-buffered reads (AT command shells, `OK`-gated
+  targets).
+- **`dio_shift`** - clock a byte out across N pins (shift-register DUTs).
+- **1-Wire depth** - multi-device search results, DS2408 (8-channel I/O),
+  DS2431/DS2433 EEPROM read/write.
+- **`spi_slave`** - bench as SPI slave so a *target* master can drive the bench
+  (completes the bidirectional matrix: I2C slave exists, SPI slave does not).
+- **SPI EEPROM shell** - 24xx/25xx EEPROM read/write (matches common bench
+  EEPROMs; carries over from the original Phase 3).
+- **`capture` output modes** - save-to-file + ASCII waveform rendering so an
+  agent can actually *see* the signal.
+- **`analog_read`** - ESP32-S3 ADC path (upstream firmware PR; the S3 has ADCs
+  the Bit Pirate firmware doesn't use yet).
+- **`spi_flash_diff`** - compare two dumps (find what a patch changed).
+- **Bluetooth mode tools** - the firmware's S3 BT mode is unexposed; upstream
+  work, larger effort, listed for completeness.
+
+### Packaging (carried)
+
+- Rename the `buspirate_mcp` package to `bitpirate_mcp`, PyPI publish, CI.
 
 ## Credits
 
@@ -176,8 +272,8 @@ needed for first use - the firmware keeps its SPI pin map in NVS
   [Christian Brooks](https://github.com/Indigaz) (Indigaz), who owns the
   hardware, set the goals, and reviews the work.
 - **Method**: every firmware-facing string is grounded in v1.8 source; the
-  whole port is test-first (221 tests) and smoke-tested against the real board
-  before each phase ships.
+  whole port is test-first (287 unit tests) and verified end-to-end on a real
+  two-board rig (92/92 protocol battery) before each phase ships.
 
 ## License
 
