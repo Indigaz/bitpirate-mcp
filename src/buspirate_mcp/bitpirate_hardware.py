@@ -129,6 +129,16 @@ UART_MARK_SENT: bytes = b"UART Write: sent"
 # uread output: "UART READ: none" or "UART READ: <contiguous hex>".
 UART_RE_READ: re.Pattern = re.compile(rb"UART READ: (none|(?:[0-9A-Fa-f]{2})+)")
 OW_RE_XFER: re.Pattern = re.compile(rb"1WIRE XFER: ((?:[0-9A-Fa-f]{2} ?)+)")
+# temp output: "DS18B20 ROM: 28 11 ... 56 " and "Temperature: 25.00 °C".
+OW_RE_TEMP_ROM: re.Pattern = re.compile(
+    rb"DS18B20 ROM: ((?:[0-9A-Fa-f]{2} ?)+)"
+)
+OW_RE_TEMP_VALUE: re.Pattern = re.compile(
+    rb"Temperature: (-?[0-9]+(?:\.[0-9]+)?)"
+)
+OW_RE_TEMP_FAIL: re.Pattern = re.compile(
+    rb"OneWire Temp: (No DS18B20 device found|Reset failed(?: before scratchpad read)?|CRC error in scratchpad)"
+)
 
 from pathlib import Path
 
@@ -1155,6 +1165,56 @@ class BitPirateHardware:
                 "Cannot parse 1-Wire xfer result", t.decode("utf-8", "replace")
             )
         return bytes.fromhex(" ".join(m.group(1).decode().split()))
+
+    def onewire_temp(self) -> dict:
+        """Run the console `temp`: ROM search for a 0x28 (DS18B20) family
+        device, trigger a conversion (0x44), read the 9-byte scratchpad
+        (0xBE) and verify its CRC.
+
+        Returns {"rom": <compact hex, e.g. "2811223344556656">,
+        "temp_c": float}. Raises BitPirateCLIError with A's failure line
+        when no device answers or the CRC check fails.
+        """
+        self._ensure_1wire()
+        t = self._cmd("temp", 15.0)
+        m_t = OW_RE_TEMP_VALUE.search(t)
+        if not m_t:
+            m_e = OW_RE_TEMP_FAIL.search(t)
+            reason = (
+                m_e.group(1).decode() if m_e else "no Temperature: line"
+            )
+            raise BitPirateCLIError(
+                f"OneWire temp failed: {reason}",
+                t.decode("utf-8", "replace"),
+            )
+        m_rom = OW_RE_TEMP_ROM.search(t)
+        rom = (
+            m_rom.group(1).decode().replace(" ", "").upper()
+            if m_rom
+            else None
+        )
+        return {"rom": rom, "temp_c": float(m_t.group(1))}
+
+    def onewire_write_spad(self, data: bytes) -> bool:
+        """Run the console `write sp <8 bytes>`: 0x0F + 8 write slots, then
+        readback + CRC verification (up to 8 firmware attempts).
+
+        Returns True on "Scratchpad write successful.", raises
+        BitPirateCLIError otherwise.
+        """
+        if len(data) != 8:
+            raise ValueError(
+                f"spad must be exactly 8 bytes, got {len(data)}"
+            )
+        self._ensure_1wire()
+        hex_part = " ".join(f"0x{b:02X}" for b in data)
+        t = self._cmd(f"write sp {hex_part}", 30.0)
+        if b"Scratchpad write successful" in t:
+            return True
+        raise BitPirateCLIError(
+            "OneWire scratchpad write failed",
+            t.decode("utf-8", "replace"),
+        )
 
     # -- teardown --
 

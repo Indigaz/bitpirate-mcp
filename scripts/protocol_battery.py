@@ -908,6 +908,66 @@ async def run_mcp_tier(bat: Battery, blog: BLog) -> None:
                f"A servo stopped: pin {d.get('pin')} reset to INPUT", json.dumps(d)[:200])
     hw.release_pin(4)
 
+    # --- Tier 5 (1-Wire DS18B20 lifecycle): ping -> spad write -> readback
+    # -> temp -> ping. B's scratchpad currently holds 11 22 33 44 55 66 77 52
+    # (console-tier write-sp); t3 overwrites it with raw temp bytes 0x0190
+    # (25.00 deg C) + config 0x0F + self-CRC-valid count bytes 02 02, so t5
+    # is deterministic AND A's write-sp CRC self-check passes.
+    d = await mcp_call("open_1wire", {"engagement_name": "battery-ow-lifecycle"})
+    t1_sid = d.get("session_id")
+    bat.record("t1-open-ow-lifecycle", T, bool(t1_sid),
+               f"session {t1_sid}" if t1_sid
+               else "no session_id: " + str(d.get("error", ""))[:120],
+               json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_ping", {"session_id": t1_sid or "stub"})
+    t2_ok = d.get("present") is True
+    bat.record("t2-ow-ping", T, t2_ok,
+               f"presence={d.get('present')}" if t2_ok
+               else str(d.get("error", ""))[:120], json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_write_spad",
+                       {"session_id": t1_sid or "stub",
+                        "spad_hex": "90010FFFFFFF0202"})
+    t3_ok = d.get("written") is True
+    bat.record("t3-ow-write-sp-25c", T, t3_ok,
+               f"spad <- 90 01 0F FF FF FF 02 02 (raw 25.00 C; self-CRC "
+               f"byte 0x02 satisfies A's write-sp CRC check)" if t3_ok
+               else str(d.get("error", ""))[:160], json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_read",
+                       {"session_id": t1_sid or "stub",
+                        "write_hex": "AA", "read_bytes": 8})
+    t4_ok = d.get("rx") == "90010FFFFFFF0202"
+    bat.record("t4-ow-spad-readback", T, t4_ok,
+               f"0xAA readback rx={d.get('rx')}", json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_temp", {"session_id": t1_sid or "stub"})
+    t5_ok = (abs(d.get("temp_c", -999.0) - 25.0) < 0.05
+             and d.get("rom") == "2811223344556656")
+    if not t5_ok:
+        # 1-Wire 0xF5 ROM search is timing-sensitive in the full-battery
+        # context (same flake class as console 1wire-scan): retry once.
+        await asyncio.sleep(0.5)
+        d = await mcp_call("onewire_temp", {"session_id": t1_sid or "stub"})
+        t5_ok = (abs(d.get("temp_c", -999.0) - 25.0) < 0.05
+                 and d.get("rom") == "2811223344556656")
+    bat.record("t5-ow-temp-25c", T, t5_ok,
+               f"temp={d.get('temp_c')} C rom={d.get('rom')} "
+               "(0x44 convert + 0xBE 9B scratchpad, CRC checked by A)"
+               if t5_ok else str(d.get("error", ""))[:160], json.dumps(d)[:300])
+
+    d = await mcp_call("onewire_ping", {"session_id": t1_sid or "stub"})
+    t6_ok = d.get("present") is True
+    bat.record("t6-ow-ping-after", T, t6_ok,
+               "bus healthy after convert cycle" if t6_ok
+               else str(d.get("error", ""))[:120], json.dumps(d)[:300])
+
+    d = await mcp_call("close_1wire", {"session_id": t1_sid or "stub"})
+    t7_ok = d.get("closed") is True
+    bat.record("t7-close-ow-lifecycle", T, t7_ok,
+               "1-wire lifecycle session closed", json.dumps(d)[:300])
+
 
 def main() -> int:
     bat = Battery()

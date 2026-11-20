@@ -640,6 +640,66 @@ async def tool_onewire_read(
     }
 
 
+async def tool_onewire_ping(
+    session_manager: SessionManager,
+    session_id: str,
+) -> dict[str, Any]:
+    """Perform a 1-Wire bus reset and report device presence."""
+    session = session_manager.get(session_id)
+
+    present = session.hardware.onewire_reset()
+
+    session.log_transaction(
+        operation="PING",
+        write_hex="",
+        read_hex="",
+        metadata={"present": present},
+    )
+
+    return {"present": present}
+
+
+async def tool_onewire_temp(
+    session_manager: SessionManager,
+    session_id: str,
+) -> dict[str, Any]:
+    """Find a DS18B20 (family 0x28), convert (0x44) and read the 9-byte
+    scratchpad (0xBE) with CRC check. Returns ROM code + temperature (deg C)."""
+    session = session_manager.get(session_id)
+
+    result = session.hardware.onewire_temp()
+
+    session.log_transaction(
+        operation="TEMP",
+        write_hex="44 BE",
+        read_hex="",
+        metadata=result,
+    )
+
+    return result
+
+
+async def tool_onewire_write_spad(
+    session_manager: SessionManager,
+    session_id: str,
+    spad_hex: str,
+) -> dict[str, Any]:
+    """Write an 8-byte scratchpad (0x0F) with readback + CRC verification."""
+    session = session_manager.get(session_id)
+
+    data = bytes.fromhex(spad_hex)
+    ok = session.hardware.onewire_write_spad(data)
+
+    session.log_transaction(
+        operation="WRITE_SPAD",
+        write_hex=spad_hex.upper(),
+        read_hex="",
+        metadata={"written": ok},
+    )
+
+    return {"written": ok, "spad_hex": spad_hex.upper()}
+
+
 async def tool_close_1wire(
     session_manager: SessionManager,
     session_id: str,

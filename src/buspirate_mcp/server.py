@@ -641,6 +641,54 @@ TOOL_DEFINITIONS = [
         },
     ),
     Tool(
+        name="onewire_ping",
+        description=(
+            "Perform a 1-Wire bus reset and report device presence. "
+            "[read-only] [Duration: fast (~1 s).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    Tool(
+        name="onewire_temp",
+        description=(
+            "Find a DS18B20 (family 0x28) on the 1-Wire bus, trigger a "
+            "temperature conversion (0x44) and read the 9-byte scratchpad "
+            "(0xBE) with CRC check. Returns ROM code and temperature in "
+            "degrees C. [read-only] [Duration: ~1.5-2.5 s (includes 750 ms "
+            "conversion).]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    Tool(
+        name="onewire_write_spad",
+        description=(
+            "Write an 8-byte scratchpad to the 1-Wire device (command 0x0F) "
+            "with readback + CRC verification (up to 8 attempts). spad_hex: "
+            "16-character hex string (8 bytes). [allowed-write] [Duration: "
+            "~1-5 s depending on verification retries.]"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "spad_hex": {"type": "string", "description": "16-character hex string, 8 bytes (e.g. '90010FFFFFFF0000')"},
+            },
+            "required": ["session_id", "spad_hex"],
+        },
+    ),
+    Tool(
         name="close_1wire",
         description="Close a 1-Wire session and reset the ESP32-Bit-Pirate to HiZ mode. [allowed-write] [Duration: instant.]",
         inputSchema={
@@ -1296,6 +1344,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 session_id=arguments["session_id"],
                 write_hex=arguments["write_hex"],
                 read_bytes=arguments["read_bytes"],
+            )
+
+        elif name == "onewire_ping":
+            result = await tools.tool_onewire_ping(
+                session_manager=session_manager,
+                session_id=arguments["session_id"],
+            )
+
+        elif name == "onewire_temp":
+            result = await tools.tool_onewire_temp(
+                session_manager=session_manager,
+                session_id=arguments["session_id"],
+            )
+
+        elif name == "onewire_write_spad":
+            result = await tools.tool_onewire_write_spad(
+                session_manager=session_manager,
+                session_id=arguments["session_id"],
+                spad_hex=arguments["spad_hex"],
             )
 
         elif name == "close_1wire":

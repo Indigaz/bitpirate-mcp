@@ -53,6 +53,9 @@ TOOL_ARGS = {
     "open_1wire": {"engagement_name": "test"},
     "onewire_search": {"session_id": "t"},
     "onewire_read": {"session_id": "t", "write_hex": "33", "read_bytes": 8},
+    "onewire_ping": {"session_id": "t"},
+    "onewire_temp": {"session_id": "t"},
+    "onewire_write_spad": {"session_id": "t", "spad_hex": "90010FFFFFFF0202"},
     "close_1wire": {"session_id": "t"},
 }
 
